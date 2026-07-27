@@ -1,5 +1,9 @@
 # cctv_zarr
 
+[![CI](https://github.com/Ikram-c/cctv_zarr/actions/workflows/ci.yml/badge.svg)](https://github.com/Ikram-c/cctv_zarr/actions/workflows/ci.yml)
+[![Demo](https://github.com/Ikram-c/cctv_zarr/actions/workflows/demo-pages.yml/badge.svg)](https://ikram-c.github.io/cctv_zarr/)
+
+
 CCTV-optimised, movement-aware OME-Zarr archival with chunk-level cloud
 query. An independent sibling of `Cloud_Dashcam_POC`, rebuilt around a
 fixed-camera surveillance workload: encoder-aligned chunking, optical-flow
@@ -165,6 +169,46 @@ cap), `flow` (Farnebäck parameters, motion threshold, minimum object
 size, the 5 s pause buffer, association radius, noise debounce),
 `zarr` (resize, grayscale, compression), `archive` (bucket,
 prefix, mock switch), `runtime` (paths, fps fallback, failure budget).
+
+## Deploying via GitHub
+
+Three GitHub Actions workflows ship with the repo (`.github/workflows/`):
+
+- **ci.yml** - on every push and pull request: the repo style gate
+  (`scripts/check_style.py`: 79-column limit, no tabs, no comments
+  outside docstrings) plus the full offline test suite on Python 3.11
+  and 3.12.
+- **release.yml** - on pushing a tag like `v0.1.0`: re-runs the tests,
+  builds the wheel and sdist, attaches them to a GitHub Release, and
+  builds/pushes a Docker image to GitHub Container Registry as
+  `ghcr.io/<owner>/cctv_zarr:<version>` and `:latest`. Uses only the
+  built-in `GITHUB_TOKEN` - no secrets to configure.
+- **demo-pages.yml** - on every push to main: builds a static,
+  backend-free demo of the web panel (canned data, full click-through)
+  and publishes it to GitHub Pages. Enable Pages once in the repo
+  settings (Settings -> Pages -> Source: GitHub Actions).
+
+First-time setup:
+
+```bash
+cd cctv_zarr
+git init && git add -A && git commit -m "cctv_zarr v0.1.0"
+git remote add origin git@github.com:<you>/cctv_zarr.git
+git push -u origin main
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Run the released container anywhere (footage and stores live in a
+mounted volume; the panel binds 0.0.0.0 inside the container - keep it
+behind your own network controls):
+
+```bash
+docker run -p 8432:8432 -v $PWD/data:/data \
+    ghcr.io/<you>/cctv_zarr:latest
+```
+
+Badge URLs in this README assume the `Ikram-c/cctv_zarr` repository
+path; adjust them if the repo lives elsewhere.
 
 ## Testing
 
