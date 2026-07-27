@@ -1,0 +1,44 @@
+gop:
+  gop_frames: 30                # match the camera encoder's closed GOP
+                                # (H.264/H.263 CCTV: IDR every 1-2 s)
+  max_video_frames: 200000
+
+flow:
+  analysis_size: [160, 120]     # dense Farneback runs at this size
+  pyr_scale: 0.5
+  levels: 3
+  winsize: 15
+  iterations: 3
+  poly_n: 5
+  poly_sigma: 1.2
+  min_magnitude_px: 0.5         # per-pixel speed to count as moving
+  min_area_frac: 0.003          # smallest object, fraction of frame
+  pause_buffer_s: 5.0           # same movement if the pause <= this
+  match_distance_frac: 0.2      # object association radius (of diag)
+  min_track_frames: 3           # shorter tracks are noise
+  max_tracks: 32                # simultaneous objects tracked
+
+zarr:
+  resize_width: null            # null = store at source resolution
+  grayscale: false              # false = 3-channel BGR
+  compression_level: 4          # zlib; 0 = raw chunks
+
+archive:
+  gcs_bucket: cctv-archive
+  gcs_prefix: sites/default
+  use_mock_gcs: true
+  local_root: mock_gcs          # mock service directory (mock only)
+
+runtime:
+  video_directory: videos
+  store_directory: stores
+  default_fps: 25.0
+  max_consecutive_fails: 25
+  video_extensions: [.mp4, .avi, .mkv, .mov]
+  timezone: UTC
+
+ui:
+  host: 127.0.0.1
+  port: 8432
+  preview_width: 480            # section-preview JPEG width
+  preview_max_frames: 60        # frames per preview request
