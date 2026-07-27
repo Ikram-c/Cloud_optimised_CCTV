@@ -7,6 +7,8 @@ name = "cctv_zarr"
 version = "0.1.0"
 description = "CCTV-optimised, movement-aware OME-Zarr archival and chunk-level cloud query"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "Ikram Choudhury"}]
 dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.9",
