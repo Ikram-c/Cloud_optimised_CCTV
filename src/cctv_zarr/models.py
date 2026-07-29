@@ -105,7 +105,14 @@ class VideoInfo:
 
 @dataclass(frozen=True, slots=True)
 class IngestResult:
-    """Outcome of ingesting one video into a store."""
+    """Outcome of ingesting one video into a store.
+
+    ``compression_ratio`` compares the store against raw uncompressed
+    frames at the stored resolution (the lossless codec's own work);
+    ``footprint_ratio`` compares it against raw frames at the source
+    resolution (resize and compression together). ``source_mb`` is the
+    original video file, reported for transparency.
+    """
 
     store_path: str
     frames_written: int
@@ -114,6 +121,11 @@ class IngestResult:
     motion_events: int
     start_time: datetime
     fps: float
+    stored_mb: float = 0.0
+    raw_mb: float = 0.0
+    source_mb: float = 0.0
+    compression_ratio: float = 1.0
+    footprint_ratio: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)

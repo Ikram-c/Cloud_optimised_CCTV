@@ -3,7 +3,7 @@
 FastAPI app serving a single-page panel built to platform interface
 guidelines: fluid system typography (base 17px), light and dark
 modes with at least 4.5:1 text contrast, safe-area insets, a fixed
-49px tab bar with three destinations that becomes a 260-320px
+49px tab bar with four destinations that becomes a 260-320px
 sidebar on wide screens, 44px minimum touch targets, 17px text
 fields, pill toggles, contained scroll views, spinners deferred one
 second, explicit-dismiss sheets at ten percent inset, an activity
@@ -16,13 +16,21 @@ Videos are selected rather than typed: the panel browses the server
 filesystem from the configured video directory, marks files that
 already have a store, and ingests either an explicit selection or a
 whole folder as one sequential batch with live per-item progress.
+
+Built to be shared: batches from concurrent users wait in a bounded
+queue served by one worker instead of turning each other away, each
+browser polls its own job and auto-saves its own panel state, and a
+configurable per-video upload cap (``ui.max_upload_mb``) is enforced
+server-side and shown in the panel before anything is copied.
 """
 
 import argparse
 import base64
 import binascii
+from dataclasses import dataclass
 import json
 import logging
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -51,9 +59,15 @@ MAX_ACTIVE_UPLOADS = 8
 MAX_UPLOAD_PART_BYTES = 16 * 1024 * 1024
 MAX_UPLOAD_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 MAX_NAME_COLLISIONS = 100
+MAX_JOB_HISTORY = 32
+MAX_WORKER_JOBS = 1000
+MAX_PREFS_CLIENTS = 64
 PREFS_FILENAME = "panel_prefs.json"
 EXPORT_DIRNAME = "exports"
 UPLOAD_PREFIX = ".upload_"
+CLIENT_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+CLIENT_ID_RE = re.compile(CLIENT_ID_PATTERN)
+DEFAULT_PREFS_CLIENT = "default"
 
 
 class BrowseRequest(BaseModel):
@@ -107,43 +121,37 @@ class ExportRequest(BaseModel):
 
 
 class PrefsRequest(BaseModel):
-    """Implicit auto-save payload for panel state."""
+    """Implicit auto-save payload for one client's panel state."""
 
     prefs: Dict[str, object] = Field(default_factory=dict)
+    client: Optional[str] = Field(
+        default=None, pattern=CLIENT_ID_PATTERN,
+    )
 
 
 class JobState:
-    """Thread-safe batch-ingest state."""
+    """Thread-safe state of one batch-ingest job."""
 
-    def __init__(self):
-        """Initialise the idle state."""
+    def __init__(self, job_id: str, total: int):
+        """Initialise a queued job.
+
+        Args:
+            job_id (str): Queue-assigned identifier.
+            total (int): Number of videos in the batch.
+        """
         self._lock = threading.Lock()
-        self.state = "idle"
-        self.total = 0
+        self.job_id = job_id
+        self.state = "queued"
+        self.total = total
         self.done = 0
         self.current = ""
         self.items: List[dict] = []
         self.error: Optional[str] = None
 
-    def try_start(self, total: int) -> bool:
-        """Claim the batch slot.
-
-        Args:
-            total (int): Number of videos in the batch.
-
-        Returns:
-            bool: False when a batch is already running.
-        """
+    def begin(self):
+        """Mark the job as running."""
         with self._lock:
-            if self.state == "running":
-                return False
             self.state = "running"
-            self.total = total
-            self.done = 0
-            self.current = ""
-            self.items = []
-            self.error = None
-            return True
 
     def start_item(self, video: str):
         """Record the video currently being ingested.
@@ -184,10 +192,11 @@ class JobState:
         """Atomically copy the state for the status endpoint.
 
         Returns:
-            dict: state, total, done, current, items, error.
+            dict: job_id, state, total, done, current, items, error.
         """
         with self._lock:
             return {
+                "job_id": self.job_id,
                 "state": self.state,
                 "total": self.total,
                 "done": self.done,
@@ -195,6 +204,143 @@ class JobState:
                 "items": list(self.items),
                 "error": self.error,
             }
+
+
+_IDLE_SNAPSHOT = {
+    "job_id": None,
+    "state": "idle",
+    "total": 0,
+    "done": 0,
+    "current": "",
+    "items": [],
+    "error": None,
+    "queued_ahead": 0,
+}
+
+
+class JobQueue:
+    """Bounded FIFO of batch jobs served by one worker thread.
+
+    Concurrent panel users each submit their own batch; jobs wait in
+    line and run one at a time, so simultaneous submissions queue
+    instead of failing and never contend for the CPU. Finished jobs
+    are kept (bounded) so every user can keep polling their own
+    job_id after it completes.
+    """
+
+    def __init__(self):
+        """Initialise the empty queue."""
+        self._lock = threading.Lock()
+        self._jobs: Dict[str, JobState] = {}
+        self._order: List[str] = []
+        self._pending: List[tuple] = []
+        self._running: Optional[JobState] = None
+        self._worker: Optional[threading.Thread] = None
+        self._counter = 0
+
+    def submit(
+        self, settings: Settings, videos: List[Path], max_queued: int,
+    ) -> Optional[str]:
+        """Add a batch to the queue and ensure the worker runs.
+
+        Args:
+            settings (Settings): Root configuration for the batch.
+            videos (List[Path]): Videos to ingest, in order.
+            max_queued (int): Maximum jobs allowed to wait in line.
+
+        Returns:
+            Optional[str]: The job id, or None when the queue is full.
+        """
+        with self._lock:
+            if len(self._pending) >= max_queued:
+                return None
+            self._counter += 1
+            job_id = f"job-{self._counter}"
+            job = JobState(job_id, len(videos))
+            self._jobs[job_id] = job
+            self._order.append(job_id)
+            self._pending.append((settings, videos, job))
+            self._evict_finished()
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._work, daemon=True,
+                )
+                self._worker.start()
+            return job_id
+
+    def _evict_finished(self):
+        """Drop oldest finished jobs beyond MAX_JOB_HISTORY."""
+        for _ in range(MAX_JOB_HISTORY):
+            if len(self._order) <= MAX_JOB_HISTORY:
+                return
+            terminal = [
+                j for j in self._order
+                if self._jobs[j].snapshot()["state"]
+                in ("done", "failed")
+            ]
+            if not terminal:
+                return
+            victim = terminal[0]
+            self._order.remove(victim)
+            self._jobs.pop(victim, None)
+
+    def _next(self) -> Optional[tuple]:
+        """Pop the next task, retiring the worker when idle.
+
+        Returns:
+            Optional[tuple]: (settings, videos, job), or None.
+        """
+        with self._lock:
+            self._running = None
+            if not self._pending:
+                self._worker = None
+                return None
+            task = self._pending.pop(0)
+            self._running = task[2]
+            return task
+
+    def _work(self):
+        """Worker-thread body: run queued batches in order."""
+        for _ in range(MAX_WORKER_JOBS):
+            task = self._next()
+            if task is None:
+                return
+            settings, videos, job = task
+            job.begin()
+            try:
+                _run_batch(settings, videos, job)
+            except (OSError, ValueError, cv2.error) as e:
+                logger.exception("Batch worker failed")
+                job.fail(str(e))
+        with self._lock:
+            self._worker = None
+            self._running = None
+
+    def snapshot(self, job_id: Optional[str]) -> dict:
+        """Report one job's state, defaulting to the newest job.
+
+        Args:
+            job_id (Optional[str]): Job to report, or None.
+
+        Returns:
+            dict: JobState snapshot plus queued_ahead, or idle.
+        """
+        with self._lock:
+            if job_id is None:
+                job_id = self._order[-1] if self._order else None
+            job = self._jobs.get(job_id) if job_id else None
+            if job is None:
+                return dict(_IDLE_SNAPSHOT)
+            ahead = 0
+            if self._running is not None and self._running is not job:
+                ahead += 1
+            for position, task in enumerate(self._pending):
+                if task[2] is job:
+                    ahead += position
+                    break
+        snap = job.snapshot()
+        snap["queued_ahead"] = ahead if snap["state"] == "queued" else 0
+        return snap
 
 
 def _store_summary(store_path: Path) -> Optional[dict]:
@@ -231,6 +377,7 @@ def _store_summary(store_path: Path) -> Optional[dict]:
         "seconds": round(
             records[-1].end_frame / attrs["cctv"]["fps"], 1,
         ),
+        "compression": attrs["cctv"].get("compression"),
     }
 
 
@@ -299,6 +446,8 @@ def _run_batch(settings: Settings, videos: List[Path], job: JobState):
                 "chunks": result.chunk_count,
                 "movement_chunks": result.movement_chunks,
                 "events": result.motion_events,
+                "stored_mb": result.stored_mb,
+                "footprint_ratio": result.footprint_ratio,
             })
         except (VideoOpenError, ValueError, OSError, cv2.error) as e:
             logger.exception("Ingest failed for %s", video)
@@ -307,87 +456,387 @@ def _run_batch(settings: Settings, videos: List[Path], job: JobState):
     job.finish()
 
 
-def create_app(config_path: Path) -> FastAPI:
-    """Build the control-panel app bound to one config file.
+def _settings_or_400(config_path: Path) -> Settings:
+    """Load settings or raise a 400.
 
     Args:
         config_path (Path): Path to config.yaml.
 
     Returns:
-        FastAPI: The application.
+        Settings: Validated settings.
+
+    Raises:
+        HTTPException: When the config cannot be loaded.
     """
-    app = FastAPI(title="CCTV Zarr")
-    job = JobState()
-    uploads: Dict[str, dict] = {}
-    uploads_lock = threading.Lock()
-    config_path = Path(config_path)
-
-    def _load_settings() -> Settings:
-        """Load settings lazily so config errors surface as 400s.
-
-        Returns:
-            Settings: Validated settings.
-        """
+    try:
         return Settings.load(config_path)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    def _settings_or_400() -> Settings:
-        """Load settings or raise a 400.
 
-        Returns:
-            Settings: Validated settings.
+def _store_root(settings: Settings, name: str) -> Path:
+    """Resolve and validate a store name inside store_directory.
 
-        Raises:
-            HTTPException: When the config cannot be loaded.
-        """
-        try:
-            return _load_settings()
-        except (FileNotFoundError, KeyError, ValueError) as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    Args:
+        settings (Settings): Root configuration.
+        name (str): Store directory name.
 
-    def _store_root(settings: Settings, name: str) -> Path:
-        """Resolve and validate a store name inside store_directory.
+    Returns:
+        Path: The store root.
 
-        Args:
-            settings (Settings): Root configuration.
-            name (str): Store directory name.
+    Raises:
+        HTTPException: On traversal attempts or missing stores.
+    """
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(
+            status_code=400,
+            detail="That recording name is not valid.",
+        )
+    root = Path(settings.runtime.store_directory) / name
+    if not root.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"That recording was not found: {name}",
+        )
+    return root
 
-        Returns:
-            Path: The store root.
 
-        Raises:
-            HTTPException: On traversal attempts or missing stores.
-        """
-        if "/" in name or "\\" in name or name.startswith("."):
+def _open_query(settings: Settings, name: str) -> QueryClient:
+    """Open a local store for querying.
+
+    Args:
+        settings (Settings): Root configuration.
+        name (str): Store directory name.
+
+    Returns:
+        QueryClient: Bound client.
+
+    Raises:
+        HTTPException: When the store is not a cctv_zarr store.
+    """
+    root = _store_root(settings, name)
+    try:
+        return QueryClient.from_local(root)
+    except QueryError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _validate_upload_name(settings: Settings, name: str) -> str:
+    """Validate a picked file name and its extension.
+
+    Args:
+        settings (Settings): Root configuration.
+        name (str): The browser-supplied file name.
+
+    Returns:
+        str: The safe file name.
+
+    Raises:
+        HTTPException: On unsafe names or non-video extensions.
+    """
+    if Path(name).name != name or name.startswith("."):
+        raise HTTPException(
+            status_code=400,
+            detail="That file name is not allowed.",
+        )
+    allowed = {e.lower() for e in settings.runtime.video_extensions}
+    if Path(name).suffix.lower() not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="That file does not look like a video.",
+        )
+    return name
+
+
+def _final_upload_path(folder: Path, name: str) -> Path:
+    """Pick a non-colliding destination for an uploaded video.
+
+    Args:
+        folder (Path): The video directory.
+        name (str): The safe file name.
+
+    Returns:
+        Path: A free destination path.
+
+    Raises:
+        HTTPException: When too many name collisions exist.
+    """
+    candidate = folder / name
+    stem, suffix = candidate.stem, candidate.suffix
+    for attempt in range(1, MAX_NAME_COLLISIONS + 1):
+        if not candidate.exists():
+            return candidate
+        candidate = folder / f"{stem}_{attempt}{suffix}"
+    raise HTTPException(
+        status_code=400,
+        detail="Too many files with that name already exist.",
+    )
+
+
+def _read_prefs_file(path: Path) -> Dict[str, dict]:
+    """Read all clients' saved panel state.
+
+    Args:
+        path (Path): The prefs file.
+
+    Returns:
+        Dict[str, dict]: Per-client prefs; legacy flat files map
+        to the default client.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    clients = data.get("clients")
+    if isinstance(clients, dict):
+        return {
+            k: v for k, v in clients.items()
+            if isinstance(v, dict)
+        }
+    return {DEFAULT_PREFS_CLIENT: data}
+
+
+def _upload_limit_bytes(settings: Settings) -> int:
+    """Resolve the per-video upload byte limit.
+
+    Args:
+        settings (Settings): Root configuration.
+
+    Returns:
+        int: The effective limit in bytes.
+    """
+    limit = MAX_UPLOAD_TOTAL_BYTES
+    if settings.ui.max_upload_mb > 0:
+        limit = min(
+            limit, settings.ui.max_upload_mb * 1000 * 1000,
+        )
+    return limit
+
+
+def _decode_part(data: str) -> bytes:
+    """Decode and bound one base64 upload part.
+
+    Args:
+        data (str): Base64 payload.
+
+    Returns:
+        bytes: Decoded bytes.
+
+    Raises:
+        HTTPException: On invalid base64 or oversized parts.
+    """
+    try:
+        payload = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="That upload was not readable.",
+        )
+    if len(payload) > MAX_UPLOAD_PART_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="That upload part is too large.",
+        )
+    return payload
+
+
+@dataclass(slots=True)
+class PanelContext:
+    """Shared mutable state for one panel application."""
+
+    config_path: Path
+    queue: JobQueue
+    uploads: Dict[str, dict]
+    uploads_lock: threading.Lock
+    prefs_lock: threading.Lock
+
+
+def _upload_begin(
+    ctx: PanelContext, req: UploadRequest, name: str, temp: Path,
+) -> dict:
+    """Open a new upload slot for part zero.
+
+    Args:
+        ctx (PanelContext): Panel state; uploads_lock is held.
+        req (UploadRequest): The first part.
+        name (str): Validated file name.
+        temp (Path): Hidden staging file.
+
+    Returns:
+        dict: The new upload entry.
+
+    Raises:
+        HTTPException: On a non-zero first part or full slots.
+    """
+    if req.seq != 0:
+        raise HTTPException(
+            status_code=400,
+            detail="That upload was interrupted. Please try again.",
+        )
+    if len(ctx.uploads) >= MAX_ACTIVE_UPLOADS:
+        raise HTTPException(
+            status_code=409,
+            detail="Too many uploads at once. Please wait a moment.",
+        )
+    entry = {"name": name, "next_seq": 0, "bytes": 0}
+    ctx.uploads[req.upload_id] = entry
+    temp.write_bytes(b"")
+    return entry
+
+
+def _upload_apply_part(
+    ctx: PanelContext,
+    settings: Settings,
+    req: UploadRequest,
+    name: str,
+    payload: bytes,
+    temp: Path,
+) -> dict:
+    """Append one part; finalise on the last part.
+
+    Args:
+        ctx (PanelContext): Panel state; uploads_lock is held.
+        settings (Settings): Root configuration.
+        req (UploadRequest): The part.
+        name (str): Validated file name.
+        payload (bytes): Decoded part bytes.
+        temp (Path): Hidden staging file.
+
+    Returns:
+        dict: Progress or completion payload.
+
+    Raises:
+        HTTPException: On sequence gaps or oversized videos.
+    """
+    entry = ctx.uploads.get(req.upload_id)
+    if entry is None:
+        entry = _upload_begin(ctx, req, name, temp)
+    if req.seq != entry["next_seq"]:
+        ctx.uploads.pop(req.upload_id, None)
+        temp.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="That upload was interrupted. Please try again.",
+        )
+    if entry["bytes"] + len(payload) > _upload_limit_bytes(settings):
+        ctx.uploads.pop(req.upload_id, None)
+        temp.unlink(missing_ok=True)
+        detail = "That video is too large to copy."
+        if settings.ui.max_upload_mb > 0:
+            detail = (
+                f"That video is over the "
+                f"{settings.ui.max_upload_mb} MB limit."
+            )
+        raise HTTPException(status_code=400, detail=detail)
+    with temp.open("ab") as handle:
+        handle.write(payload)
+    entry["next_seq"] += 1
+    entry["bytes"] += len(payload)
+    if not req.last:
+        return {"done": False, "received": entry["bytes"]}
+    ctx.uploads.pop(req.upload_id, None)
+    final = _final_upload_path(temp.parent, entry["name"])
+    temp.rename(final)
+    return {"done": True, "path": str(final)}
+
+
+def _collect_batch_videos(
+    settings: Settings, req: IngestRequest,
+) -> List[Path]:
+    """Resolve and deduplicate the requested batch videos.
+
+    Args:
+        settings (Settings): Root configuration.
+        req (IngestRequest): The batch request.
+
+    Returns:
+        List[Path]: Unique, existing videos in order.
+
+    Raises:
+        HTTPException: On missing folders/videos or empty requests.
+    """
+    videos: List[Path] = []
+    if req.folder:
+        folder = Path(req.folder).expanduser()
+        if not folder.is_dir():
             raise HTTPException(
                 status_code=400,
-                detail="That recording name is not valid.",
+                detail=f"That folder was not found: {folder}",
             )
-        root = Path(settings.runtime.store_directory) / name
-        if not root.is_dir():
+        videos.extend(_discover_folder_videos(
+            folder, settings.runtime.video_extensions,
+        ))
+    for raw in req.videos[:MAX_BATCH_VIDEOS]:
+        path = Path(raw).expanduser()
+        if not path.is_file():
             raise HTTPException(
-                status_code=404,
-                detail=f"That recording was not found: {name}",
+                status_code=400,
+                detail=f"That video was not found: {path}",
             )
-        return root
+        videos.append(path)
+    unique: List[Path] = []
+    seen = set()
+    for path in videos:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    if not unique:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose at least one video first.",
+        )
+    return unique
 
-    def _open_query(settings: Settings, name: str) -> QueryClient:
-        """Open a local store for querying.
 
-        Args:
-            settings (Settings): Root configuration.
-            name (str): Store directory name.
+def _encode_previews(images, stamps, settings: Settings) -> List[dict]:
+    """JPEG-encode a bounded preview strip of one section.
 
-        Returns:
-            QueryClient: Bound client.
+    Args:
+        images: Frames of the fetched section.
+        stamps: Per-frame POSIX timestamps.
+        settings (Settings): Root configuration.
 
-        Raises:
-            HTTPException: When the store is not a cctv_zarr store.
-        """
-        root = _store_root(settings, name)
-        try:
-            return QueryClient.from_local(root)
-        except QueryError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    Returns:
+        List[dict]: base64 JPEGs with timestamps.
+    """
+    limit = settings.ui.preview_max_frames
+    stride = max(1, len(images) // limit)
+    encoded: List[dict] = []
+    for position in range(0, len(images), stride):
+        frame = images[position]
+        width = settings.ui.preview_width
+        if frame.shape[1] > width:
+            height = max(
+                1, int(frame.shape[0] * width / frame.shape[1]),
+            )
+            frame = cv2.resize(
+                frame, (width, height),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, buffer = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72],
+        )
+        if not ok:
+            continue
+        encoded.append({
+            "jpeg": base64.b64encode(
+                buffer.tobytes()
+            ).decode("ascii"),
+            "timestamp": float(stamps[position]),
+        })
+    return encoded
+
+
+def _add_basic_routes(app: FastAPI, ctx: PanelContext):
+    """Register the panel page, status, and config routes.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
@@ -395,28 +844,57 @@ def create_app(config_path: Path) -> FastAPI:
         return HTMLResponse(_INDEX_HTML)
 
     @app.get("/api/status")
-    def status() -> dict:
-        """Report the batch-ingest state."""
-        return job.snapshot()
+    def status(job: Optional[str] = None) -> dict:
+        """Report one batch job's state, newest by default."""
+        return ctx.queue.snapshot(job)
+
+    @app.get("/api/config")
+    def config_info() -> dict:
+        """Expose the panel-relevant limits."""
+        settings = _settings_or_400(ctx.config_path)
+        return {
+            "max_upload_mb": settings.ui.max_upload_mb,
+            "max_queued_jobs": settings.ui.max_queued_jobs,
+        }
+
+
+def _add_stores_route(app: FastAPI, ctx: PanelContext):
+    """Register the store-listing route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.get("/api/stores")
     def stores() -> dict:
         """List readable stores under store_directory."""
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         root = Path(settings.runtime.store_directory)
         found: List[dict] = []
         if root.is_dir():
-            candidates = sorted(p for p in root.iterdir() if p.is_dir())
+            candidates = sorted(
+                p for p in root.iterdir() if p.is_dir()
+            )
             for path in candidates[:MAX_STORES_LISTED]:
                 summary = _store_summary(path)
                 if summary is not None:
                     found.append(summary)
         return {"stores": found}
 
+
+def _add_browse_route(app: FastAPI, ctx: PanelContext):
+    """Register the folder-browsing route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
+
     @app.post("/api/browse")
     def browse(req: BrowseRequest) -> dict:
         """List one folder's subfolders and selectable videos."""
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         base = (
             Path(req.path).expanduser()
             if req.path else Path(settings.runtime.video_directory)
@@ -439,7 +917,9 @@ def create_app(config_path: Path) -> FastAPI:
             p.name for p in children
             if p.is_dir() and not p.name.startswith(".")
         ][:MAX_FOLDERS_LISTED]
-        allowed = {e.lower() for e in settings.runtime.video_extensions}
+        allowed = {
+            e.lower() for e in settings.runtime.video_extensions
+        }
         videos = []
         for p in children:
             if len(videos) >= MAX_VIDEOS_LISTED:
@@ -450,7 +930,9 @@ def create_app(config_path: Path) -> FastAPI:
                 "name": p.name,
                 "path": str(p),
                 "size_mb": round(p.stat().st_size / 1e6, 2),
-                "ingested": (store_root / (p.stem + ".zarr")).is_dir(),
+                "ingested": (
+                    store_root / (p.stem + ".zarr")
+                ).is_dir(),
             })
         return {
             "path": str(base),
@@ -459,55 +941,14 @@ def create_app(config_path: Path) -> FastAPI:
             "videos": videos,
         }
 
-    def _validate_upload_name(settings: Settings, name: str) -> str:
-        """Validate a picked file name and its extension.
 
-        Args:
-            settings (Settings): Root configuration.
-            name (str): The browser-supplied file name.
+def _add_upload_route(app: FastAPI, ctx: PanelContext):
+    """Register the chunked-upload route.
 
-        Returns:
-            str: The safe file name.
-
-        Raises:
-            HTTPException: On unsafe names or non-video extensions.
-        """
-        if Path(name).name != name or name.startswith("."):
-            raise HTTPException(
-                status_code=400,
-                detail="That file name is not allowed.",
-            )
-        allowed = {e.lower() for e in settings.runtime.video_extensions}
-        if Path(name).suffix.lower() not in allowed:
-            raise HTTPException(
-                status_code=400,
-                detail="That file does not look like a video.",
-            )
-        return name
-
-    def _final_upload_path(folder: Path, name: str) -> Path:
-        """Pick a non-colliding destination for an uploaded video.
-
-        Args:
-            folder (Path): The video directory.
-            name (str): The safe file name.
-
-        Returns:
-            Path: A free destination path.
-
-        Raises:
-            HTTPException: When too many name collisions exist.
-        """
-        candidate = folder / name
-        stem, suffix = candidate.stem, candidate.suffix
-        for attempt in range(1, MAX_NAME_COLLISIONS + 1):
-            if not candidate.exists():
-                return candidate
-            candidate = folder / f"{stem}_{attempt}{suffix}"
-        raise HTTPException(
-            status_code=400,
-            detail="Too many files with that name already exist.",
-        )
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.post("/api/upload")
     def upload(req: UploadRequest) -> dict:
@@ -517,115 +958,55 @@ def create_app(config_path: Path) -> FastAPI:
         temporary file in the video directory; the last part renames
         it to its final name and returns the saved path.
         """
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         name = _validate_upload_name(settings, req.name)
-        try:
-            payload = base64.b64decode(req.data, validate=True)
-        except (binascii.Error, ValueError):
-            raise HTTPException(
-                status_code=400,
-                detail="That upload was not readable.",
-            )
-        if len(payload) > MAX_UPLOAD_PART_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail="That upload part is too large.",
-            )
+        payload = _decode_part(req.data)
         folder = Path(settings.runtime.video_directory)
         folder.mkdir(parents=True, exist_ok=True)
         temp = folder / (UPLOAD_PREFIX + req.upload_id)
-        with uploads_lock:
-            entry = uploads.get(req.upload_id)
-            if entry is None:
-                if req.seq != 0:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="That upload was interrupted. "
-                               "Please try again.",
-                    )
-                if len(uploads) >= MAX_ACTIVE_UPLOADS:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Too many uploads at once. "
-                               "Please wait a moment.",
-                    )
-                entry = {"name": name, "next_seq": 0, "bytes": 0}
-                uploads[req.upload_id] = entry
-                temp.write_bytes(b"")
-            if req.seq != entry["next_seq"]:
-                uploads.pop(req.upload_id, None)
-                temp.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail="That upload was interrupted. "
-                           "Please try again.",
-                )
-            if entry["bytes"] + len(payload) > MAX_UPLOAD_TOTAL_BYTES:
-                uploads.pop(req.upload_id, None)
-                temp.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail="That video is too large to copy.",
-                )
-            with temp.open("ab") as handle:
-                handle.write(payload)
-            entry["next_seq"] += 1
-            entry["bytes"] += len(payload)
-            if not req.last:
-                return {"done": False, "received": entry["bytes"]}
-            uploads.pop(req.upload_id, None)
-            final = _final_upload_path(folder, entry["name"])
-            temp.rename(final)
-        return {"done": True, "path": str(final)}
+        with ctx.uploads_lock:
+            return _upload_apply_part(
+                ctx, settings, req, name, payload, temp,
+            )
+
+
+def _add_ingest_route(app: FastAPI, ctx: PanelContext):
+    """Register the batch-ingest route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.post("/api/ingest")
     def ingest(req: IngestRequest) -> dict:
-        """Launch a batch ingest in a daemon thread."""
-        settings = _settings_or_400()
-        videos: List[Path] = []
-        if req.folder:
-            folder = Path(req.folder).expanduser()
-            if not folder.is_dir():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"That folder was not found: {folder}",
-                )
-            videos.extend(_discover_folder_videos(
-                folder, settings.runtime.video_extensions,
-            ))
-        for raw in req.videos[:MAX_BATCH_VIDEOS]:
-            path = Path(raw).expanduser()
-            if not path.is_file():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"That video was not found: {path}",
-                )
-            videos.append(path)
-        unique: List[Path] = []
-        seen = set()
-        for path in videos:
-            key = str(path)
-            if key not in seen:
-                seen.add(key)
-                unique.append(path)
-        if not unique:
+        """Queue a batch ingest for the worker thread."""
+        settings = _settings_or_400(ctx.config_path)
+        unique = _collect_batch_videos(settings, req)
+        job_id = ctx.queue.submit(
+            settings, unique, settings.ui.max_queued_jobs,
+        )
+        if job_id is None:
             raise HTTPException(
-                status_code=400, detail="Choose at least one video first.",
+                status_code=409, detail="The waiting line is full "
+                       "right now. Please try again in a moment.",
             )
-        if not job.try_start(len(unique)):
-            raise HTTPException(
-                status_code=409, detail="Another task is still running. "
-                       "Please wait for it to finish.",
-            )
-        threading.Thread(
-            target=_run_batch, args=(settings, unique, job), daemon=True,
-        ).start()
-        return {"started": True, "count": len(unique)}
+        return {"started": True, "count": len(unique),
+                "job_id": job_id}
+
+
+def _add_query_route(app: FastAPI, ctx: PanelContext):
+    """Register the chunk-query route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.post("/api/query")
     def query(req: QueryRequest) -> dict:
         """Resolve a time/movement query to chunk records."""
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         client = _open_query(settings, req.store)
         movement = True if req.movement_only else None
         try:
@@ -636,7 +1017,9 @@ def create_app(config_path: Path) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         all_records = client.records
         return {
-            "records": [_record_dict(r) for r in selection.records],
+            "records": [
+                _record_dict(r) for r in selection.records
+            ],
             "all_chunks": [_record_dict(r) for r in all_records],
             "events": [
                 {
@@ -650,12 +1033,24 @@ def create_app(config_path: Path) -> FastAPI:
             "total": len(all_records),
         }
 
+
+def _add_frames_route(app: FastAPI, ctx: PanelContext):
+    """Register the section-preview route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
+
     @app.post("/api/frames")
     def frames(req: FramesRequest) -> dict:
         """Return JPEG previews for one chunk's section."""
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         client = _open_query(settings, req.store)
-        matched = [r for r in client.records if r.index == req.chunk_index]
+        matched = [
+            r for r in client.records
+            if r.index == req.chunk_index
+        ]
         if not matched:
             raise HTTPException(
                 status_code=404,
@@ -668,34 +1063,24 @@ def create_app(config_path: Path) -> FastAPI:
             frame_end=matched[0].end_frame,
         )
         images, stamps = client.fetch(selection)
-        limit = settings.ui.preview_max_frames
-        stride = max(1, len(images) // limit)
-        encoded: List[dict] = []
-        for position in range(0, len(images), stride):
-            frame = images[position]
-            width = settings.ui.preview_width
-            if frame.shape[1] > width:
-                height = max(
-                    1, int(frame.shape[0] * width / frame.shape[1]),
-                )
-                frame = cv2.resize(
-                    frame, (width, height), interpolation=cv2.INTER_AREA,
-                )
-            ok, buffer = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72],
-            )
-            if not ok:
-                continue
-            encoded.append({
-                "jpeg": base64.b64encode(buffer.tobytes()).decode("ascii"),
-                "timestamp": float(stamps[position]),
-            })
-        return {"frames": encoded, "chunk": _record_dict(matched[0])}
+        return {
+            "frames": _encode_previews(images, stamps, settings),
+            "chunk": _record_dict(matched[0]),
+        }
+
+
+def _add_export_route(app: FastAPI, ctx: PanelContext):
+    """Register the clip-export route.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
 
     @app.post("/api/export")
     def export(req: ExportRequest) -> dict:
         """Export the matching section as an MP4 clip."""
-        settings = _settings_or_400()
+        settings = _settings_or_400(ctx.config_path)
         client = _open_query(settings, req.store)
         movement = True if req.movement_only else None
         try:
@@ -706,14 +1091,21 @@ def create_app(config_path: Path) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         if not selection.records:
             raise HTTPException(
-                status_code=400, detail="Nothing matched that search.",
+                status_code=400,
+                detail="Nothing matched that search.",
             )
-        out_dir = Path(settings.runtime.store_directory) / EXPORT_DIRNAME
+        out_dir = (
+            Path(settings.runtime.store_directory) / EXPORT_DIRNAME
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = selection.records[0].start_time.strftime("%Y%m%dT%H%M%S")
+        stamp = selection.records[0].start_time.strftime(
+            "%Y%m%dT%H%M%S"
+        )
         out_path = out_dir / f"{req.store}_{stamp}.mp4"
         try:
-            written = client.export_mp4(selection, out_path, fps=req.fps)
+            written = client.export_mp4(
+                selection, out_path, fps=req.fps,
+            )
         except QueryError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {
@@ -722,30 +1114,86 @@ def create_app(config_path: Path) -> FastAPI:
             "chunks": len(selection.records),
         }
 
+
+def _add_prefs_routes(app: FastAPI, ctx: PanelContext):
+    """Register the panel-state read and write routes.
+
+    Args:
+        app (FastAPI): The application.
+        ctx (PanelContext): Shared panel state.
+    """
+
     @app.get("/api/prefs")
-    def read_prefs() -> dict:
-        """Return the auto-saved panel state."""
+    def read_prefs(client: Optional[str] = None) -> dict:
+        """Return one client's auto-saved panel state."""
         try:
-            settings = _load_settings()
+            settings = Settings.load(ctx.config_path)
         except (FileNotFoundError, KeyError, ValueError):
             return {"prefs": {}}
-        path = Path(settings.runtime.store_directory) / PREFS_FILENAME
+        key = (
+            client if client and CLIENT_ID_RE.match(client)
+            else DEFAULT_PREFS_CLIENT
+        )
+        path = (
+            Path(settings.runtime.store_directory) / PREFS_FILENAME
+        )
         if not path.is_file():
             return {"prefs": {}}
-        try:
-            return {"prefs": json.loads(path.read_text())}
-        except (ValueError, OSError):
-            return {"prefs": {}}
+        with ctx.prefs_lock:
+            return {"prefs": _read_prefs_file(path).get(key, {})}
 
     @app.post("/api/prefs")
     def write_prefs(req: PrefsRequest) -> dict:
-        """Persist the auto-saved panel state."""
-        settings = _settings_or_400()
+        """Persist one client's auto-saved panel state."""
+        settings = _settings_or_400(ctx.config_path)
         root = Path(settings.runtime.store_directory)
         root.mkdir(parents=True, exist_ok=True)
-        (root / PREFS_FILENAME).write_text(json.dumps(req.prefs))
+        key = req.client or DEFAULT_PREFS_CLIENT
+        path = root / PREFS_FILENAME
+        with ctx.prefs_lock:
+            clients = _read_prefs_file(path)
+            clients.pop(key, None)
+            clients[key] = req.prefs
+            names = list(clients)
+            excess = max(len(names) - MAX_PREFS_CLIENTS, 0)
+            for name in names[:excess]:
+                clients.pop(name, None)
+            path.write_text(json.dumps({"clients": clients}))
         return {"saved": True}
 
+
+_ROUTE_REGISTRARS = (
+    _add_basic_routes,
+    _add_stores_route,
+    _add_browse_route,
+    _add_upload_route,
+    _add_ingest_route,
+    _add_query_route,
+    _add_frames_route,
+    _add_export_route,
+    _add_prefs_routes,
+)
+
+
+def create_app(config_path: Path) -> FastAPI:
+    """Build the control-panel app bound to one config file.
+
+    Args:
+        config_path (Path): Path to config.yaml.
+
+    Returns:
+        FastAPI: The application.
+    """
+    app = FastAPI(title="CCTV Zarr")
+    ctx = PanelContext(
+        config_path=Path(config_path),
+        queue=JobQueue(),
+        uploads={},
+        uploads_lock=threading.Lock(),
+        prefs_lock=threading.Lock(),
+    )
+    for register in _ROUTE_REGISTRARS:
+        register(app, ctx)
     return app
 
 
@@ -781,6 +1229,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   --grid: #e1e0d9; --baseline: #c3c2b7;
   --border: rgba(11,11,11,0.10);
   --series-1: #2a78d6; --quiet: #e1e0d9;
+  --series-raw: #9ec5f4;
   --danger: #d03b3b; --good: #006300;
 }
 @media (prefers-color-scheme: dark) {
@@ -790,6 +1239,7 @@ _INDEX_HTML = """<!DOCTYPE html>
     --grid: #2c2c2a; --baseline: #383835;
     --border: rgba(255,255,255,0.10);
     --series-1: #3987e5; --quiet: #2c2c2a;
+    --series-raw: #184f95;
     --danger: #e66767; --good: #0ca30c;
   }
 }
@@ -797,7 +1247,8 @@ _INDEX_HTML = """<!DOCTYPE html>
 html, body { height: 100%; }
 body {
   font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-  font-size: 17px; line-height: 1.45;
+  font-size: clamp(17px, 0.5vw + 15px, 19px); line-height: 1.45;
+  -webkit-text-size-adjust: 100%;
   background: var(--page); color: var(--ink-1);
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
            0 env(safe-area-inset-left);
@@ -914,12 +1365,13 @@ label.field {
 .tab-bar button {
   flex: 1; border: 0; border-radius: 0; background: none;
   color: var(--ink-muted); font-size: 15px; min-height: 49px;
+  padding: 0 4px; min-width: 0;
 }
 .tab-bar button.active { color: var(--series-1); font-weight: 600; }
 .view { display: none; }
 .view.active { display: block; }
 .timeline { display: flex; gap: 2px; align-items: flex-end;
-  height: 72px; padding: 8px 0; }
+  height: clamp(56px, 9vh, 88px); padding: 8px 0; }
 .timeline .bar {
   flex: 1; min-width: 3px; border-radius: 4px 4px 0 0;
   background: var(--quiet); height: 30%; cursor: pointer;
@@ -930,7 +1382,8 @@ label.field {
   color: var(--ink-muted); font-size: 13px;
   border-top: 1px solid var(--baseline); padding-top: 4px; }
 .ringwrap { display: flex; gap: 16px; align-items: center; }
-.ring { width: 96px; height: 96px; transform: rotate(-90deg); }
+.ring { width: clamp(84px, 12vw, 112px);
+  height: clamp(84px, 12vw, 112px); transform: rotate(-90deg); }
 .ring .track { fill: none; stroke: var(--grid); stroke-width: 10; }
 .ring .val {
   fill: none; stroke: var(--series-1); stroke-width: 10;
@@ -960,7 +1413,7 @@ label.field {
   align-items: center; margin-bottom: 12px; }
 .preview { display: flex; gap: 8px; overflow-x: auto;
   overscroll-behavior: contain; touch-action: pan-x; }
-.preview img { height: 160px; border-radius: 8px;
+.preview img { height: clamp(120px, 24vh, 200px); border-radius: 8px;
   border: 1px solid var(--border); }
 .menu {
   position: absolute; z-index: 50; min-width: 180px;
@@ -970,6 +1423,32 @@ label.field {
 }
 .menu button { display: block; width: 100%; text-align: left;
   border: 0; background: none; }
+.hero { display: flex; flex-direction: column; gap: 4px;
+  margin-bottom: 12px; }
+.heronum { font-size: clamp(28px, 3vw + 17px, 40px);
+  font-weight: 700; line-height: 1.1; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap;
+  color: var(--ink-2); font-size: 15px; margin-bottom: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 12px; height: 12px; border-radius: 3px;
+  flex: none; }
+.swatch.raw { background: var(--series-raw); }
+.swatch.stored { background: var(--series-1); }
+.bars { display: flex; flex-direction: column; gap: 14px; }
+.barrow .title { font-size: 17px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.barline { display: flex; align-items: center; gap: 8px;
+  margin-top: 4px; }
+.bartrack { flex: 1; height: 12px; border-radius: 999px;
+  background: none; }
+.hbar { height: 12px; border-radius: 999px; min-width: 2px; }
+.hbar.raw { background: var(--series-raw); }
+.hbar.stored { background: var(--series-1); }
+.barvalue { color: var(--ink-2); font-size: 15px; flex: none;
+  min-width: 72px; text-align: right;
+  font-variant-numeric: tabular-nums; }
+.footnote { color: var(--ink-muted); font-size: 13px;
+  margin-top: 12px; }
 .error { color: var(--danger); margin-top: 8px; min-height: 22px; }
 .ok { color: var(--good); }
 @media (min-width: 900px) {
@@ -994,6 +1473,9 @@ label.field {
   }
   .only-narrow { display: none; }
 }
+@media (min-width: 1280px) {
+  .content { max-width: 860px; }
+}
 </style>
 </head>
 <body>
@@ -1008,6 +1490,7 @@ label.field {
       <button data-tab="ingest" class="active">Add footage</button>
       <button data-tab="stores">Library</button>
       <button data-tab="query">Search</button>
+      <button data-tab="storage">Results</button>
     </nav>
   </aside>
   <main class="content">
@@ -1022,6 +1505,7 @@ label.field {
         <h2>Choose videos</h2>
         <div class="drop" id="dropzone">
           <div>Drop videos here, or pick them with a click</div>
+          <div class="sub" id="upload-limit"></div>
           <div class="row" style="justify-content: center;">
             <button class="primary" id="btn-pick-files">
               Choose files</button>
@@ -1068,6 +1552,7 @@ label.field {
     <section class="view" id="view-stores">
       <div class="card">
         <h2>Library</h2>
+        <div class="sub" id="library-compression"></div>
         <div class="list" id="store-list"></div>
       </div>
     </section>
@@ -1075,9 +1560,10 @@ label.field {
     <section class="view" id="view-query">
       <div class="card">
         <h2>Search footage</h2>
-        <label class="field" for="query-store">Recording</label>
-        <input type="text" id="query-store" placeholder="cam01.zarr"
+        <label class="field">Recording - tap to choose</label>
+        <input type="text" id="query-store" class="hiddeninput"
                autocomplete="off">
+        <div class="list" id="query-store-list"></div>
         <label class="field" for="query-start">From (date and time)</label>
         <input type="text" id="query-start" autocomplete="off"
                placeholder="2026-07-20 14:03">
@@ -1119,6 +1605,25 @@ label.field {
         <div class="list" id="chunk-list"></div>
       </div>
     </section>
+
+    <section class="view" id="view-storage">
+      <div class="card">
+        <h2>Storage savings</h2>
+        <div class="hero">
+          <div class="heronum" id="storage-hero">-</div>
+          <div class="sub" id="storage-hero-sub"></div>
+        </div>
+        <div class="legend">
+          <span><span class="swatch raw"></span>Uncompressed</span>
+          <span><span class="swatch stored"></span>Stored</span>
+        </div>
+        <div class="bars" id="storage-bars"></div>
+        <div class="footnote">Uncompressed means the raw video
+        frames before any compression, not the original camera
+        file.</div>
+        <div class="error" id="storage-error"></div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -1126,6 +1631,7 @@ label.field {
   <button data-tab="ingest" class="active">Add footage</button>
   <button data-tab="stores">Library</button>
   <button data-tab="query">Search</button>
+  <button data-tab="storage">Results</button>
 </nav>
 
 <div class="sheet-backdrop" id="backdrop"></div>
@@ -1157,6 +1663,30 @@ let lastQuery = null;
 let menuChunk = null;
 let pollTimer = null;
 let dirty = false;
+let currentJobId = null;
+let maxUploadMb = 0;
+
+function initClientId() {
+  let id = "";
+  try { id = window.localStorage.getItem("cctvPanelClient") || ""; }
+  catch (e) { id = ""; }
+  if (!id) {
+    id = "c" + Math.random().toString(36).slice(2, 12);
+    try { window.localStorage.setItem("cctvPanelClient", id); }
+    catch (e) {}
+  }
+  return id;
+}
+const clientId = initClientId();
+
+async function loadConfig() {
+  try {
+    const data = await api("/api/config");
+    maxUploadMb = data.max_upload_mb || 0;
+    document.getElementById("upload-limit").textContent = maxUploadMb
+      ? "Videos up to " + maxUploadMb + " MB each" : "";
+  } catch (e) {}
+}
 
 function haptic(ms) {
   if (navigator.vibrate) { navigator.vibrate(ms); }
@@ -1221,6 +1751,8 @@ function switchTab(name) {
   document.querySelectorAll(".view").forEach(v =>
     v.classList.toggle("active", v.id === "view-" + name));
   if (name === "stores") { loadStores(); }
+  if (name === "query") { loadQueryStores(); }
+  if (name === "storage") { loadStorage(); }
   markDirty();
 }
 document.querySelectorAll("[data-tab]").forEach(b =>
@@ -1286,8 +1818,11 @@ async function browse(path) {
     }
     for (const v of data.videos) { list.appendChild(videoCell(v)); }
     if (!data.folders.length && !data.videos.length) {
-      list.innerHTML += '<div class="cell"><div class="grow">' +
-        '<div class="meta">Empty folder</div></div></div>';
+      const none = document.createElement("div");
+      none.className = "cell";
+      none.innerHTML = '<div class="grow">' +
+        '<div class="meta">Empty folder</div></div>';
+      list.appendChild(none);
     }
     markDirty();
   } catch (e) {
@@ -1314,12 +1849,24 @@ function isVideoName(name) {
 }
 
 async function uploadPicked(fileList) {
-  const files = Array.from(fileList)
+  const all = Array.from(fileList)
     .filter(f => isVideoName(f.name)).slice(0, 50);
   const errorEl = document.getElementById("ingest-error");
   errorEl.textContent = "";
+  const limitBytes = maxUploadMb * 1000 * 1000;
+  const oversized = limitBytes
+    ? all.filter(f => f.size > limitBytes) : [];
+  const files = limitBytes
+    ? all.filter(f => f.size <= limitBytes) : all;
+  if (oversized.length) {
+    errorEl.textContent = "Skipped " + oversized.length +
+      " video(s) over the " + maxUploadMb + " MB limit: " +
+      oversized.map(f => f.name).join(", ");
+  }
   if (!files.length) {
-    errorEl.textContent = "No videos were picked.";
+    if (!oversized.length) {
+      errorEl.textContent = "No videos were picked.";
+    }
     return;
   }
   const row = document.getElementById("upload-row");
@@ -1424,7 +1971,8 @@ async function startIngest(body) {
   const errorEl = document.getElementById("ingest-error");
   errorEl.textContent = "";
   try {
-    await api("/api/ingest", body);
+    const res = await api("/api/ingest", body);
+    currentJobId = res.job_id || null;
     haptic(10);
     document.getElementById("batch-card").hidden = false;
     document.getElementById("batch-items").textContent = "";
@@ -1448,8 +1996,11 @@ function renderBatch(s) {
   document.getElementById("batch-count").textContent =
     s.done + " / " + s.total;
   document.getElementById("batch-current").textContent =
-    s.state === "running" && s.current
-      ? "Working on " + s.current : "";
+    s.state === "queued"
+      ? "Waiting in line - " + (s.queued_ahead || 0) +
+        " task(s) ahead"
+      : (s.state === "running" && s.current
+         ? "Working on " + s.current : "");
   const list = document.getElementById("batch-items");
   list.textContent = "";
   for (const item of s.items) {
@@ -1469,7 +2020,11 @@ function renderBatch(s) {
         (item.events
           ? item.events + " movement(s) across " +
             item.movement_chunks + " of " + item.chunks + " sections"
-          : "no movement") + "</div></div>" +
+          : "no movement") +
+        (item.footprint_ratio
+          ? " - " + item.footprint_ratio.toFixed(1) +
+            "x smaller than raw"
+          : "") + "</div></div>" +
         '<span class="badge">\\u2713</span>';
     }
     list.appendChild(cell);
@@ -1487,9 +2042,10 @@ function pollStatus() {
       return;
     }
     try {
-      const s = await api("/api/status");
+      const s = await api("/api/status" +
+        (currentJobId ? "?job=" + currentJobId : ""));
       renderBatch(s);
-      if (s.state === "running") {
+      if (s.state === "running" || s.state === "queued") {
         pollTimer = setTimeout(tick, POLL_MS);
         return;
       }
@@ -1515,17 +2071,37 @@ function pollStatus() {
 
 async function loadStores() {
   const list = document.getElementById("store-list");
+  const banner = document.getElementById("library-compression");
   try {
     const data = await api("/api/stores");
     list.textContent = "";
     if (!data.stores.length) {
+      banner.textContent = "";
       list.innerHTML = '<div class="cell"><div class="grow">' +
         '<div class="meta">Your library is empty. ' +
         "Add footage first." +
         "</div></div></div>";
       return;
     }
+    let rawTotal = 0;
+    let storedTotal = 0;
     for (const s of data.stores) {
+      if (s.compression) {
+        rawTotal += s.compression.raw_mb;
+        storedTotal += s.compression.stored_mb;
+      }
+    }
+    banner.textContent = storedTotal > 0
+      ? "Altogether: " + Math.round(rawTotal) +
+        " MB of raw frames stored in " + Math.round(storedTotal) +
+        " MB - " + (rawTotal / storedTotal).toFixed(1) +
+        "x smaller than raw"
+      : "";
+    for (const s of data.stores) {
+      const squeeze = s.compression
+        ? " - " + s.compression.footprint_ratio.toFixed(1) +
+          "x smaller than raw"
+        : "";
       const cell = document.createElement("div");
       cell.className = "cell";
       cell.innerHTML =
@@ -1533,7 +2109,8 @@ async function loadStores() {
         '"></span><div class="grow"><div class="title">' + s.name +
         '</div><div class="meta">' + fmtSecs(s.seconds) +
         " - movement in " + s.movement_chunks + " of " + s.chunks +
-        " sections - " + s.size_mb + " MB</div></div>";
+        " sections - " + s.size_mb + " MB" + squeeze +
+        "</div></div>";
       cell.addEventListener("click", () => {
         haptic(10);
         document.getElementById("query-store").value = s.name;
@@ -1541,6 +2118,111 @@ async function loadStores() {
         runQuery();
       });
       list.appendChild(cell);
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="cell"><div class="grow">' +
+      '<div class="meta">' + e.message + "</div></div></div>";
+  }
+}
+
+function fmtMb(mb) {
+  if (mb >= 1024) { return (mb / 1024).toFixed(1) + " GB"; }
+  return Math.round(mb) + " MB";
+}
+
+function storageRow(name, rawMb, storedMb, maxRaw) {
+  const rawPct = Math.max(100 * rawMb / maxRaw, 0.5);
+  const storedPct = Math.max(100 * storedMb / maxRaw, 0.5);
+  const row = document.createElement("div");
+  row.className = "barrow";
+  row.title = name + ": " + fmtMb(rawMb) +
+    " uncompressed, " + fmtMb(storedMb) + " stored";
+  row.innerHTML =
+    '<div class="title">' + name + "</div>" +
+    '<div class="barline"><div class="bartrack">' +
+    '<div class="hbar raw" style="width:' + rawPct +
+    '%"></div></div>' +
+    '<span class="barvalue">' + fmtMb(rawMb) + "</span></div>" +
+    '<div class="barline"><div class="bartrack">' +
+    '<div class="hbar stored" style="width:' + storedPct +
+    '%"></div></div>' +
+    '<span class="barvalue">' + fmtMb(storedMb) + "</span></div>";
+  return row;
+}
+
+async function loadStorage() {
+  const bars = document.getElementById("storage-bars");
+  const hero = document.getElementById("storage-hero");
+  const heroSub = document.getElementById("storage-hero-sub");
+  const errorEl = document.getElementById("storage-error");
+  errorEl.textContent = "";
+  try {
+    const data = await api("/api/stores");
+    bars.textContent = "";
+    const rows = data.stores.filter(s => s.compression);
+    if (!rows.length) {
+      hero.textContent = "-";
+      heroSub.textContent =
+        "Add footage first to see how much space you save.";
+      return;
+    }
+    let rawTotal = 0;
+    let storedTotal = 0;
+    let maxRaw = 0;
+    for (const s of rows) {
+      rawTotal += s.compression.raw_mb;
+      storedTotal += s.compression.stored_mb;
+      maxRaw = Math.max(maxRaw, s.compression.raw_mb);
+    }
+    const ratio = storedTotal > 0 ? rawTotal / storedTotal : 0;
+    hero.textContent = ratio.toFixed(1) + "x smaller";
+    heroSub.textContent = fmtMb(storedTotal) +
+      " stored instead of " + fmtMb(rawTotal) + " uncompressed";
+    for (const s of rows) {
+      bars.appendChild(storageRow(
+        s.name, s.compression.raw_mb,
+        s.compression.stored_mb, maxRaw));
+    }
+  } catch (e) {
+    errorEl.textContent = e.message;
+  }
+}
+
+function queryStoreCell(s) {
+  const cell = document.createElement("div");
+  const current = document.getElementById("query-store").value;
+  cell.className = "cell" + (current === s.name ? " selected" : "");
+  cell.innerHTML =
+    '<span class="check">\\u2713</span>' +
+    '<span class="dot ' + (s.movement_chunks ? "on" : "") +
+    '"></span><div class="grow"><div class="title">' + s.name +
+    '</div><div class="meta">' + fmtSecs(s.seconds) +
+    " - movement in " + s.movement_chunks + " of " + s.chunks +
+    " sections</div></div>";
+  cell.addEventListener("click", () => {
+    haptic(10);
+    document.getElementById("query-store").value = s.name;
+    document.querySelectorAll("#query-store-list .cell")
+      .forEach(c => c.classList.remove("selected"));
+    cell.classList.add("selected");
+    markDirty();
+  });
+  return cell;
+}
+
+async function loadQueryStores() {
+  const list = document.getElementById("query-store-list");
+  try {
+    const data = await api("/api/stores");
+    list.textContent = "";
+    if (!data.stores.length) {
+      list.innerHTML = '<div class="cell"><div class="grow">' +
+        '<div class="meta">Your library is empty. ' +
+        "Add footage first.</div></div></div>";
+      return;
+    }
+    for (const s of data.stores) {
+      list.appendChild(queryStoreCell(s));
     }
   } catch (e) {
     list.innerHTML = '<div class="cell"><div class="grow">' +
@@ -1563,10 +2245,15 @@ function queryBody() {
 async function runQuery() {
   const errorEl = document.getElementById("query-error");
   errorEl.textContent = "";
+  const body = queryBody();
+  if (!body.store) {
+    errorEl.textContent = "Choose a recording first.";
+    return;
+  }
   const spinner = document.getElementById("query-spinner");
   try {
     const data = await delayedSpinner(
-      spinner, api("/api/query", queryBody()));
+      spinner, api("/api/query", body));
     haptic(10);
     lastQuery = data;
     renderQuery(data);
@@ -1757,15 +2444,18 @@ async function autoSave() {
     end: document.getElementById("query-end").value,
     movement_only: document.getElementById("movement-only").checked,
   };
-  try { await api("/api/prefs", {prefs: prefs}); } catch (e) {}
+  try {
+    await api("/api/prefs", {prefs: prefs, client: clientId});
+  } catch (e) {}
 }
 setInterval(autoSave, AUTO_SAVE_MS);
 window.addEventListener("pagehide", autoSave);
 
 async function restore() {
   let folder = null;
+  loadConfig();
   try {
-    const data = await api("/api/prefs");
+    const data = await api("/api/prefs?client=" + clientId);
     const p = data.prefs || {};
     if (p.store) {
       document.getElementById("query-store").value = p.store;

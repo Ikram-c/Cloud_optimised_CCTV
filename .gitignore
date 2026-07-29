@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+stores/
+mock_gcs/
+query_cache/
+dataset_run/
+dataset_report.csv
+site/
+uv.lock

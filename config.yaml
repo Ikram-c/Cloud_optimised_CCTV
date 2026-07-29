@@ -42,3 +42,5 @@ ui:
   port: 8432
   preview_width: 480            # section-preview JPEG width
   preview_max_frames: 60        # frames per preview request
+  max_upload_mb: 0              # per-video upload cap, 0 = off
+  max_queued_jobs: 4            # batches allowed to wait in line

@@ -26,6 +26,102 @@ MOVEMENT_PATH = "movement_detected"
 TIMESTAMPS_PATH = "timestamps"
 
 
+def _multiscales_entry(name: str, fps: float) -> dict:
+    """Build the NGFF multiscales entry for the image.
+
+    Args:
+        name (str): Human-readable image name.
+        fps (float): Frame rate; the t-axis scale is 1/fps seconds.
+
+    Returns:
+        dict: One multiscales list entry.
+    """
+    return {
+        "version": NGFF_VERSION,
+        "name": name,
+        "axes": [
+            {"name": "t", "type": "time", "unit": "second"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space"},
+            {"name": "y", "type": "space"},
+            {"name": "x", "type": "space"},
+        ],
+        "datasets": [{
+            "path": IMAGE_PATH,
+            "coordinateTransformations": [{
+                "type": "scale",
+                "scale": [1.0 / fps, 1.0, 1.0, 1.0, 1.0],
+            }],
+        }],
+        "metadata": {
+            "description": (
+                "CCTV footage; time chunks are closed GOPs "
+                "(encoder-aligned) with movement-activated "
+                "flagged segments"
+            ),
+        },
+    }
+
+
+def _serialize_events(
+    events: Sequence[MotionEvent],
+    start_time: datetime,
+    fps: float,
+) -> list:
+    """Serialise movement events with ISO UTC timestamps.
+
+    Args:
+        events (Sequence[MotionEvent]): Per-object movement events.
+        start_time (datetime): Timezone-aware timestamp of frame 0.
+        fps (float): Frame rate.
+
+    Returns:
+        list: JSON-safe event entries.
+    """
+    return [
+        {
+            "track_id": e.track_id,
+            "start_frame": e.start_frame,
+            "end_frame": e.end_frame,
+            "start_time": (
+                start_time + timedelta(seconds=e.start_frame / fps)
+            ).astimezone(timezone.utc).isoformat(),
+            "end_time": (
+                start_time
+                + timedelta(seconds=(e.end_frame + 1) / fps)
+            ).astimezone(timezone.utc).isoformat(),
+        }
+        for e in events
+    ]
+
+
+def _serialize_records(records: Sequence[ChunkRecord]) -> list:
+    """Serialise the chunk manifest.
+
+    Args:
+        records (Sequence[ChunkRecord]): The chunk manifest.
+
+    Returns:
+        list: JSON-safe manifest entries.
+    """
+    return [
+        {
+            "index": r.index,
+            "start_frame": r.start_frame,
+            "end_frame": r.end_frame,
+            "start_time": r.start_time.astimezone(
+                timezone.utc
+            ).isoformat(),
+            "end_time": r.end_time.astimezone(
+                timezone.utc
+            ).isoformat(),
+            "movement_detected": r.movement,
+            "trigger": r.trigger,
+        }
+        for r in records
+    ]
+
+
 def build_group_attrs(
     name: str,
     fps: float,
@@ -55,69 +151,18 @@ def build_group_attrs(
     """
     if events and start_time is None:
         raise ValueError("events require a start_time")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
     return {
-        "multiscales": [{
-            "version": NGFF_VERSION,
-            "name": name,
-            "axes": [
-                {"name": "t", "type": "time", "unit": "second"},
-                {"name": "c", "type": "channel"},
-                {"name": "z", "type": "space"},
-                {"name": "y", "type": "space"},
-                {"name": "x", "type": "space"},
-            ],
-            "datasets": [{
-                "path": IMAGE_PATH,
-                "coordinateTransformations": [{
-                    "type": "scale",
-                    "scale": [1.0 / fps, 1.0, 1.0, 1.0, 1.0],
-                }],
-            }],
-            "metadata": {
-                "description": (
-                    "CCTV footage; time chunks are closed GOPs "
-                    "(encoder-aligned) with movement-activated "
-                    "flagged segments"
-                ),
-            },
-        }],
+        "multiscales": [_multiscales_entry(name, fps)],
         "cctv": {
             "source_video": source_video,
             "fps": fps,
             "gop_frames": gop_frames,
             "movement_array": MOVEMENT_PATH,
             "timestamps_array": TIMESTAMPS_PATH,
-            "events": [
-                {
-                    "track_id": e.track_id,
-                    "start_frame": e.start_frame,
-                    "end_frame": e.end_frame,
-                    "start_time": (
-                        start_time + timedelta(seconds=e.start_frame / fps)
-                    ).astimezone(timezone.utc).isoformat(),
-                    "end_time": (
-                        start_time
-                        + timedelta(seconds=(e.end_frame + 1) / fps)
-                    ).astimezone(timezone.utc).isoformat(),
-                }
-                for e in events
-            ],
-            "chunks": [
-                {
-                    "index": r.index,
-                    "start_frame": r.start_frame,
-                    "end_frame": r.end_frame,
-                    "start_time": r.start_time.astimezone(
-                        timezone.utc
-                    ).isoformat(),
-                    "end_time": r.end_time.astimezone(
-                        timezone.utc
-                    ).isoformat(),
-                    "movement_detected": r.movement,
-                    "trigger": r.trigger,
-                }
-                for r in records
-            ],
+            "events": _serialize_events(events, start_time, fps),
+            "chunks": _serialize_records(records),
         },
     }
 

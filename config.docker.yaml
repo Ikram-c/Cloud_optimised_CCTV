@@ -1,0 +1,44 @@
+gop:
+  gop_frames: 30
+  max_video_frames: 200000
+flow:
+  analysis_size:
+  - 160
+  - 120
+  pyr_scale: 0.5
+  levels: 3
+  winsize: 15
+  iterations: 3
+  poly_n: 5
+  poly_sigma: 1.2
+  min_magnitude_px: 0.5
+  min_area_frac: 0.003
+  pause_buffer_s: 5.0
+  match_distance_frac: 0.2
+  min_track_frames: 3
+  max_tracks: 32
+zarr:
+  resize_width: null
+  grayscale: false
+  compression_level: 4
+archive:
+  gcs_bucket: cctv-archive
+  gcs_prefix: sites/default
+  use_mock_gcs: true
+  local_root: /data/mock_gcs
+runtime:
+  video_directory: /data/videos
+  store_directory: /data/stores
+  default_fps: 25.0
+  max_consecutive_fails: 25
+  video_extensions:
+  - .mp4
+  - .avi
+  - .mkv
+  - .mov
+  timezone: UTC
+ui:
+  host: 0.0.0.0
+  port: 8432
+  preview_width: 480
+  preview_max_frames: 60

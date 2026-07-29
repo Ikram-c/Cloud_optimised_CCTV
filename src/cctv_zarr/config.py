@@ -10,14 +10,48 @@ from typing import Any, Optional
 
 import yaml
 
+MAX_CONFIG_NODES = 100_000
 
-def _to_tuple(value: Any) -> Any:
-    """Convert YAML lists to tuples recursively for immutability."""
-    if isinstance(value, list):
-        return tuple(_to_tuple(v) for v in value)
-    if isinstance(value, dict):
-        return {k: _to_tuple(v) for k, v in value.items()}
-    return value
+
+def _to_tuple(root: Any) -> Any:
+    """Convert nested YAML lists to tuples, iteratively and bounded.
+
+    Post-order traversal with an explicit stack: children convert
+    before their container, no recursion, at most MAX_CONFIG_NODES
+    visits.
+
+    Args:
+        root: A YAML-decoded value.
+
+    Returns:
+        Any: The value with every list converted to a tuple.
+
+    Raises:
+        ValueError: If the document exceeds MAX_CONFIG_NODES nodes.
+    """
+    if not isinstance(root, (list, dict)):
+        return root
+    stack = [(root, False)]
+    done: dict = {}
+    for _ in range(MAX_CONFIG_NODES):
+        if not stack:
+            return done[id(root)]
+        node, expanded = stack.pop()
+        if not isinstance(node, (list, dict)):
+            done[id(node)] = node
+        elif not expanded:
+            stack.append((node, True))
+            children = (
+                node if isinstance(node, list) else node.values()
+            )
+            stack.extend((child, False) for child in children)
+        elif isinstance(node, list):
+            done[id(node)] = tuple(done[id(c)] for c in node)
+        else:
+            done[id(node)] = {
+                k: done[id(c)] for k, c in node.items()
+            }
+    raise ValueError("config document too large")
 
 
 def _build(cls, section: Optional[dict]):
@@ -157,12 +191,20 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class UIConfig:
-    """Web control panel host/port and preview limits."""
+    """Web control panel host/port, preview and sharing limits.
+
+    ``max_upload_mb`` caps each video copied through the panel
+    (0 disables the cap); ``max_queued_jobs`` bounds how many batch
+    tasks may wait in line behind the running one, so several
+    concurrent users queue instead of being turned away.
+    """
 
     host: str
     port: int
     preview_width: int
     preview_max_frames: int
+    max_upload_mb: int = 0
+    max_queued_jobs: int = 4
 
     def __post_init__(self):
         if not 1 <= self.port <= 65535:
@@ -171,6 +213,10 @@ class UIConfig:
             raise ValueError("preview_width must be positive")
         if self.preview_max_frames <= 0:
             raise ValueError("preview_max_frames must be positive")
+        if self.max_upload_mb < 0:
+            raise ValueError("max_upload_mb must be >= 0")
+        if self.max_queued_jobs <= 0:
+            raise ValueError("max_queued_jobs must be positive")
 
 
 @dataclass(frozen=True, slots=True)

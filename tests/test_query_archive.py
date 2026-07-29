@@ -99,7 +99,7 @@ class TestArchiveQuery:
         assert len(q.records) == 4
         image_dir = cache / "cam01.zarr" / ome.IMAGE_PATH
         fetched = [p for p in image_dir.iterdir() if p.name != ".zarray"]
-        assert fetched == []  # no pixel chunks moved yet
+        assert fetched == []
 
     def test_partial_fetch_only_selected_chunks(self, archived, tmp_path):
         archive, _ = archived
@@ -114,7 +114,7 @@ class TestArchiveQuery:
             p.name for p in image_dir.iterdir() if p.name != ".zarray"
         )
         expected = sorted(f"{i}.0.0.0.0" for i in sel.chunk_indices)
-        assert fetched == expected  # unselected chunks stayed remote
+        assert fetched == expected
 
     def test_fetched_section_matches_query_window(self, archived, tmp_path):
         archive, _ = archived
@@ -125,7 +125,7 @@ class TestArchiveQuery:
         end = T0 + timedelta(seconds=0.8)
         frames, stamps = q.fetch(q.select(start=start, end=end))
         assert stamps.min() >= T0.timestamp()
-        assert stamps.max() < end.timestamp() + 0.4  # within chunk pad
+        assert stamps.max() < end.timestamp() + 0.4
 
     def test_export_mp4(self, archived, tmp_path):
         archive, _ = archived

@@ -82,7 +82,13 @@ class TestIndex:
         for marker in ("CCTV Archive", "Add footage", "Library",
                        "Search footage", "Choose files",
                        "Drop videos here",
-                       "Only show movement", "tab-bar"):
+                       "Only show movement", "tab-bar",
+                       ">Results<", "Storage savings",
+                       "view-storage", "storage-bars",
+                       "Uncompressed", "Stored",
+                       "upload-limit", "Waiting in line",
+                       "/api/config", "query-store-list",
+                       "tap to choose"):
             assert marker in text
 
     def test_no_technical_jargon_in_labels(self, env):
@@ -95,6 +101,10 @@ class TestIndex:
     def test_guideline_rules_present(self, env):
         text = env["client"].get("/").text
         for rule in ("-apple-system", "font-size: 17px",
+                     "clamp(17px, 0.5vw + 15px, 19px)",
+                     "clamp(84px, 12vw, 112px)",
+                     "min-width: 1280px",
+                     "--series-raw",
                      "min-height: 44px",
                      "env(safe-area-inset-bottom)",
                      "border-radius: 22.5%",
@@ -119,6 +129,17 @@ class TestStatusAndStores:
         assert store["chunks"] == 4
         assert store["movement_chunks"] >= 1
         assert 0.0 <= store["movement_ratio"] <= 1.0
+
+    def test_stores_carry_compression(self, env):
+        store = env["client"].get("/api/stores").json()["stores"][0]
+        block = store["compression"]
+        assert block["footprint_ratio"] > 1.0
+        assert block["raw_mb"] > block["stored_mb"]
+
+    def test_compression_highlight_served(self, env):
+        text = env["client"].get("/").text
+        assert "smaller than raw" in text
+        assert "library-compression" in text
 
 
 class TestBrowseEndpoint:
@@ -388,3 +409,116 @@ class TestPrefs:
     def test_empty_when_unsaved(self, env, tmp_path):
         fresh = TestClient(create_app(_write_config(tmp_path / "b")))
         assert fresh.get("/api/prefs").json() == {"prefs": {}}
+
+    def test_per_client_isolation(self, env):
+        client = env["client"]
+        client.post("/api/prefs", json={
+            "prefs": {"tab": "query"}, "client": "alpha",
+        })
+        client.post("/api/prefs", json={
+            "prefs": {"tab": "stores"}, "client": "beta",
+        })
+        alpha = client.get("/api/prefs?client=alpha").json()
+        beta = client.get("/api/prefs?client=beta").json()
+        assert alpha["prefs"]["tab"] == "query"
+        assert beta["prefs"]["tab"] == "stores"
+        assert client.get("/api/prefs").json() == {"prefs": {}}
+
+    def test_bad_client_id_is_422(self, env):
+        res = env["client"].post("/api/prefs", json={
+            "prefs": {}, "client": "../evil",
+        })
+        assert res.status_code == 422
+
+
+class TestDemoLimits:
+    def test_config_reports_limits(self, env):
+        body = env["client"].get("/api/config").json()
+        assert body["max_upload_mb"] == 0
+        assert body["max_queued_jobs"] >= 1
+
+    def test_upload_over_config_limit_is_400(self, tmp_path):
+        config_path = _write_config(tmp_path)
+        raw = yaml.safe_load(config_path.read_text())
+        raw["ui"]["max_upload_mb"] = 1
+        config_path.write_text(yaml.safe_dump(raw))
+        client = TestClient(create_app(config_path))
+        payload = b"x" * 1_200_000
+        res = client.post("/api/upload", json={
+            "upload_id": "ux", "name": "big.mp4", "seq": 0,
+            "last": True,
+            "data": base64.b64encode(payload).decode("ascii"),
+        })
+        assert res.status_code == 400
+        assert "1 MB limit" in res.json()["detail"]
+        leftovers = [
+            p for p in tmp_path.iterdir()
+            if p.name.startswith(".upload_")
+        ]
+        assert leftovers == []
+
+    def test_upload_under_config_limit_ok(self, tmp_path):
+        config_path = _write_config(tmp_path)
+        raw = yaml.safe_load(config_path.read_text())
+        raw["ui"]["max_upload_mb"] = 1
+        config_path.write_text(yaml.safe_dump(raw))
+        client = TestClient(create_app(config_path))
+        payload = b"x" * 200_000
+        res = client.post("/api/upload", json={
+            "upload_id": "uy", "name": "small.mp4", "seq": 0,
+            "last": True,
+            "data": base64.b64encode(payload).decode("ascii"),
+        })
+        assert res.status_code == 200
+        assert res.json()["done"] is True
+
+
+class TestJobQueue:
+    def test_concurrent_batches_queue_not_409(self, env, tmp_path):
+        frames = static_frames(10) + approach_frames(10)
+        one = write_video(tmp_path / "q1.mp4", frames)
+        two = write_video(tmp_path / "q2.mp4", frames)
+        client = env["client"]
+        first = client.post("/api/ingest", json={
+            "videos": [str(one)],
+        })
+        second = client.post("/api/ingest", json={
+            "videos": [str(two)],
+        })
+        assert first.status_code == 200
+        assert second.status_code == 200
+        id1 = first.json()["job_id"]
+        id2 = second.json()["job_id"]
+        assert id1 != id2
+        for job_id in (id1, id2):
+            deadline = time.time() + DEADLINE_S
+            state = "queued"
+            while time.time() < deadline:
+                state = client.get(
+                    f"/api/status?job={job_id}",
+                ).json()["state"]
+                if state in ("done", "failed"):
+                    break
+                time.sleep(0.1)
+            assert state == "done"
+        names = [
+            s["name"] for s in
+            client.get("/api/stores").json()["stores"]
+        ]
+        assert "q1.zarr" in names and "q2.zarr" in names
+
+    def test_status_carries_job_id(self, env, tmp_path):
+        frames = static_frames(10) + approach_frames(10)
+        video = write_video(tmp_path / "q3.mp4", frames)
+        res = env["client"].post("/api/ingest", json={
+            "videos": [str(video)],
+        })
+        job_id = res.json()["job_id"]
+        body = env["client"].get(f"/api/status?job={job_id}").json()
+        assert body["job_id"] == job_id
+        assert body["state"] in ("queued", "running", "done")
+        assert _wait_terminal(env["client"]) == "done"
+
+    def test_unknown_job_is_idle(self, env):
+        body = env["client"].get("/api/status?job=nope").json()
+        assert body["state"] == "idle"
