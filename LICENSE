@@ -17,6 +17,17 @@ product or publication that incorporates or is derived from it, must
 give clear and visible attribution to the original author, Ikram
 Choudhury, in its documentation, "About" screen, or other credits.
 
+Acceptable use. The stores this Software produces are declared
+non-biometric sources (each carries "biometric_source": false in its
+governance metadata). The Software must not be used to extract
+biometric templates from, run facial recognition over, or build or
+expand facial-recognition databases from stored footage; untargeted
+scraping of CCTV footage for such databases is prohibited by
+Article 5(1)(e) of the EU AI Act, and retail facial recognition is
+effectively prohibited under GDPR Article 9. This clause puts
+downstream users on notice of the design intent (GDPR Article 25);
+it does not constitute legal advice.
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
 OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.

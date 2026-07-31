@@ -15,6 +15,7 @@ client fetch exactly the chunks it needs.
 """
 
 import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -22,7 +23,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from . import ome, zarr_io
+from . import audit, ome, zarr_io
 from .capture import VideoCapture, iter_frames, read_info
 from .chunker import build_chunk_records
 from .config import Settings
@@ -73,13 +74,9 @@ class CctvZarrWriter:
         video_path = Path(video_path)
         store_path = Path(store_path)
         info = read_info(video_path, self.settings.runtime.default_fps)
-        if start_time is None:
-            start_time = datetime.fromtimestamp(
-                video_path.stat().st_mtime, tz=timezone.utc,
-            )
-        if start_time.tzinfo is None:
-            raise ValueError("start_time must be timezone-aware")
-
+        start_time, time_source = self._resolve_start(
+            video_path, start_time,
+        )
         out_w, out_h = self._output_size(info.width, info.height)
         channels = 1 if self.settings.zarr.grayscale else 3
         total_cap = min(
@@ -101,7 +98,38 @@ class CctvZarrWriter:
         return self._finalize(
             store_path, video_path, info, written, channels,
             out_w, out_h, start_time, tracker.events(),
+            time_source,
         )
+
+    @staticmethod
+    def _resolve_start(
+        video_path: Path, start_time: Optional[datetime],
+    ):
+        """Resolve frame-0 time and record its provenance.
+
+        Args:
+            video_path (Path): Source video file.
+            start_time (Optional[datetime]): Explicit timestamp.
+
+        Returns:
+            Tuple: (aware start time, 'explicit' | 'file_mtime').
+
+        Raises:
+            ValueError: On a naive explicit timestamp.
+        """
+        if start_time is None:
+            logger.warning(
+                "%s: start_time falls back to file mtime; pass an "
+                "explicit recording time for evidential use",
+                video_path.name,
+            )
+            fallback = datetime.fromtimestamp(
+                video_path.stat().st_mtime, tz=timezone.utc,
+            )
+            return fallback, "file_mtime"
+        if start_time.tzinfo is None:
+            raise ValueError("start_time must be timezone-aware")
+        return start_time, "explicit"
 
     def _create_image(
         self,
@@ -143,6 +171,7 @@ class CctvZarrWriter:
         out_h: int,
         start_time: datetime,
         events,
+        time_source: str,
     ) -> IngestResult:
         """Write sidecars and metadata, then report the ingest.
 
@@ -156,6 +185,7 @@ class CctvZarrWriter:
             out_h (int): Stored height.
             start_time (datetime): Timestamp of frame 0.
             events: Per-object movement events.
+            time_source (str): 'explicit' or 'file_mtime'.
 
         Returns:
             IngestResult: Store statistics.
@@ -165,14 +195,71 @@ class CctvZarrWriter:
             self.settings.gop, flags, start_time, info.fps,
         )
         self._write_sidecars(store_path, flags, start_time, info.fps)
+        if not self.settings.retention.keep_non_movement:
+            self._minimise(store_path, records)
         sizes = self._measure(
             store_path, video_path, info, written, channels,
             out_w, out_h,
         )
-        self._write_attrs(
-            store_path, video_path, info, records, events,
-            start_time, sizes, written,
+        events_out = (
+            events if self.settings.flow.record_events else []
         )
+        self._write_attrs(
+            store_path, video_path, info, records, events_out,
+            start_time, sizes, written, time_source,
+        )
+        return self._result(
+            store_path, info, written, start_time, records,
+            events, sizes,
+        )
+
+    def _minimise(self, store_path: Path, records) -> int:
+        """Delete non-movement image chunks at ingest (Art. 25).
+
+        Args:
+            store_path (Path): Store root.
+            records: Chunk manifest records.
+
+        Returns:
+            int: Chunk files deleted.
+        """
+        image = zarr_io.ZarrArray.open(store_path / ome.IMAGE_PATH)
+        quiet = [r.index for r in records if r.movement == 0]
+        removed = 0
+        for index in quiet:
+            if image.delete_chunk((index, 0, 0, 0, 0)):
+                removed += 1
+        if removed:
+            audit.log_deletion(
+                store_path.parent, "minimisation",
+                store_path.name, chunks=quiet,
+            )
+        return removed
+
+    @staticmethod
+    def _result(
+        store_path: Path,
+        info,
+        written: int,
+        start_time: datetime,
+        records,
+        events,
+        sizes: dict,
+    ) -> IngestResult:
+        """Assemble the ingest report.
+
+        Args:
+            store_path (Path): Store root.
+            info: VideoInfo of the source.
+            written (int): Frames written.
+            start_time (datetime): Timestamp of frame 0.
+            records: Chunk manifest records.
+            events: Per-object movement events.
+            sizes (dict): Compression measurements.
+
+        Returns:
+            IngestResult: Store statistics.
+        """
         return IngestResult(
             store_path=str(store_path),
             frames_written=written,
@@ -188,6 +275,30 @@ class CctvZarrWriter:
             footprint_ratio=sizes["footprint_ratio"],
         )
 
+    def _governance_block(self) -> dict:
+        """Build the accountability block written to every store.
+
+        Returns:
+            dict: Governance fields plus design declarations.
+        """
+        block = asdict(self.settings.governance)
+        block["biometric_source"] = False
+        block["retention_policy_hours"] = {
+            "movement": self.settings.retention.movement_max_age_hours,
+            "non_movement": (
+                self.settings.retention.non_movement_max_age_hours
+            ),
+        }
+        if (
+            not block["controller"]
+            and not self.settings.archive.use_mock_gcs
+        ):
+            logger.warning(
+                "governance.controller is empty while using a real "
+                "archive; set controller identity for Art. 30",
+            )
+        return block
+
     def _write_attrs(
         self,
         store_path: Path,
@@ -198,6 +309,7 @@ class CctvZarrWriter:
         start_time: datetime,
         sizes: dict,
         written: int,
+        time_source: str,
     ):
         """Write group attributes and log the ingest summary.
 
@@ -206,10 +318,12 @@ class CctvZarrWriter:
             video_path (Path): Source video file.
             info: VideoInfo of the source.
             records: Chunk manifest records.
-            events: Per-object movement events.
+            events: Serialisable movement events ([] when the
+                per-object record is disabled).
             start_time (datetime): Timestamp of frame 0.
             sizes (dict): Compression measurements.
             written (int): Frames written.
+            time_source (str): 'explicit' or 'file_mtime'.
         """
         attrs = ome.build_group_attrs(
             name=video_path.stem,
@@ -226,6 +340,11 @@ class CctvZarrWriter:
             resize_width=self.settings.zarr.resize_width,
             grayscale=self.settings.zarr.grayscale,
         )
+        attrs["cctv"]["time_source"] = time_source
+        attrs["cctv"]["non_movement_stored"] = (
+            self.settings.retention.keep_non_movement
+        )
+        attrs["cctv"]["governance"] = self._governance_block()
         zarr_io.write_group(store_path, attrs)
         logger.info(
             "%s: %d frames, %d chunks (%d movement), "

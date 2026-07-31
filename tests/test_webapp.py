@@ -396,6 +396,86 @@ class TestFramesAndExport:
         assert res.status_code == 400
 
 
+class TestPanelSecurity:
+    def _secured(self, tmp_path):
+        config_path = _write_config(tmp_path)
+        raw = yaml.safe_load(config_path.read_text())
+        raw["security"] = {"auth_token": "secret-code"}
+        config_path.write_text(yaml.safe_dump(raw))
+        return TestClient(create_app(config_path))
+
+    def test_api_requires_token(self, tmp_path):
+        client = self._secured(tmp_path)
+        assert client.get("/api/stores").status_code == 401
+        assert client.get("/api/status").status_code == 401
+        res = client.post(
+            "/api/browse", json={},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert res.status_code == 401
+
+    def test_token_grants_access(self, tmp_path):
+        client = self._secured(tmp_path)
+        headers = {"Authorization": "Bearer secret-code"}
+        assert client.get(
+            "/api/stores", headers=headers,
+        ).status_code == 200
+        assert client.get("/").status_code == 200
+
+    def test_no_token_config_stays_open(self, env):
+        assert env["client"].get("/api/stores").status_code == 200
+
+    def test_browse_confined_to_video_area(self, env):
+        res = env["client"].post("/api/browse", json={"path": "/"})
+        assert res.status_code == 400
+        assert "outside" in res.json()["detail"]
+
+    def test_ingest_confined_to_video_area(self, env, tmp_path):
+        outside = tmp_path.parent / "outside.mp4"
+        res = env["client"].post("/api/ingest", json={
+            "videos": [str(outside)],
+        })
+        assert res.status_code == 400
+
+    def test_reingest_tombstones_not_destroys(self, env):
+        client = env["client"]
+        video = env["video"]
+        res = client.post("/api/ingest", json={
+            "videos": [str(video)],
+        })
+        assert res.status_code == 200
+        assert _wait_terminal(client) == "done"
+        stores = Path(env["tmp"]) / "stores"
+        replaced = stores / "_replaced" / "cam01.zarr"
+        assert replaced.is_dir()
+        assert (replaced / ".zattrs").is_file()
+        log = (stores / "deletion_log.jsonl").read_text()
+        assert "replace" in log
+
+    def test_export_is_access_logged(self, env):
+        res = env["client"].post("/api/export", json={
+            "store": "cam01.zarr", "movement_only": True,
+            "client": "auditme",
+        })
+        assert res.status_code == 200
+        log_path = Path(env["tmp"]) / "stores" / "access_log.jsonl"
+        text = log_path.read_text()
+        assert '"action": "export"' in text
+        assert "auditme" in text
+
+    def test_replaced_stores_hidden_from_listing(self, env):
+        client = env["client"]
+        client.post("/api/ingest", json={
+            "videos": [str(env["video"])],
+        })
+        assert _wait_terminal(client) == "done"
+        names = [
+            s["name"] for s in
+            client.get("/api/stores").json()["stores"]
+        ]
+        assert names.count("cam01.zarr") == 1
+
+
 class TestPrefs:
     def test_roundtrip(self, env):
         saved = env["client"].post("/api/prefs", json={

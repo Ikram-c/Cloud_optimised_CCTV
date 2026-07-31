@@ -54,6 +54,25 @@ def _to_tuple(root: Any) -> Any:
     raise ValueError("config document too large")
 
 
+def _build_defaulted(cls, section: Optional[dict]):
+    """Instantiate a fully-defaulted section, absent = defaults.
+
+    Args:
+        cls: The dataclass type (every field has a default).
+        section (Optional[dict]): Raw YAML mapping, or None.
+
+    Returns:
+        The dataclass instance.
+
+    Raises:
+        KeyError: On unknown keys.
+        ValueError: On invalid values.
+    """
+    if section is None:
+        return cls()
+    return _build(cls, section)
+
+
 def _build(cls, section: Optional[dict]):
     """Instantiate a frozen dataclass from a YAML section.
 
@@ -122,6 +141,7 @@ class FlowConfig:
     match_distance_frac: float
     min_track_frames: int
     max_tracks: int
+    record_events: bool = True
 
     def __post_init__(self):
         if len(self.analysis_size) != 2:
@@ -163,12 +183,100 @@ class ZarrConfig:
 
 @dataclass(frozen=True, slots=True)
 class ArchiveConfig:
-    """Cloud archive (GCS) destination."""
+    """Cloud archive (GCS) destination.
+
+    ``bucket_location`` pins where footage may physically live
+    (GDPR Chapter V): when set, binding to a real bucket in any
+    other location fails closed. The mock archive is always local.
+    """
 
     gcs_bucket: Optional[str]
     gcs_prefix: str
     use_mock_gcs: bool
     local_root: Optional[str]
+    bucket_location: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionConfig:
+    """Storage limitation (GDPR Art. 5(1)(e)) and minimisation.
+
+    Movement and non-movement chunks expire separately;
+    ``keep_non_movement: false`` never stores quiet footage at all
+    (data minimisation by design, Art. 25). Exports and query
+    caches expire on their own clocks so no copy outlives its
+    chunk. ``source_after_ingest`` governs the original file:
+    ``keep``, ``quarantine`` (moved aside for a short hold), or
+    ``delete``.
+    """
+
+    enabled: bool = True
+    movement_max_age_hours: float = 720.0
+    non_movement_max_age_hours: float = 72.0
+    exports_max_age_hours: float = 72.0
+    cache_max_age_hours: float = 24.0
+    keep_non_movement: bool = True
+    source_after_ingest: str = "keep"
+
+    def __post_init__(self):
+        if self.movement_max_age_hours <= 0:
+            raise ValueError("movement_max_age_hours must be positive")
+        if self.non_movement_max_age_hours <= 0:
+            raise ValueError(
+                "non_movement_max_age_hours must be positive",
+            )
+        if self.exports_max_age_hours <= 0:
+            raise ValueError("exports_max_age_hours must be positive")
+        if self.cache_max_age_hours <= 0:
+            raise ValueError("cache_max_age_hours must be positive")
+        if self.source_after_ingest not in (
+            "keep", "quarantine", "delete",
+        ):
+            raise ValueError(
+                "source_after_ingest must be keep, quarantine, "
+                "or delete",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GovernanceConfig:
+    """Accountability metadata written into every store.
+
+    Travels with the store (GDPR Arts. 5(2), 30): controller
+    identity, site, purpose, legal basis, retention policy, and
+    DPO contact. Empty values are tolerated only against the mock
+    archive; real-archive ingest warns loudly.
+    """
+
+    controller: str = ""
+    site_id: str = ""
+    purpose: str = ""
+    legal_basis: str = ""
+    retention_policy: str = ""
+    dpo_contact: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityConfig:
+    """Processing security (GDPR Art. 32).
+
+    ``auth_token`` protects every panel endpoint; the panel
+    refuses to leave loopback unless a token is set and
+    ``allow_remote`` is explicitly true (behind TLS termination).
+    ``encrypt_archive`` encrypts every object client-side (Fernet,
+    AES-128-CBC + HMAC) before it reaches the bucket.
+    """
+
+    auth_token: str = ""
+    allow_remote: bool = False
+    encrypt_archive: bool = False
+    encryption_key: str = ""
+
+    def __post_init__(self):
+        if self.encrypt_archive and not self.encryption_key:
+            raise ValueError(
+                "encrypt_archive requires encryption_key",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +337,9 @@ class Settings:
     archive: ArchiveConfig
     runtime: RuntimeConfig
     ui: UIConfig
+    retention: RetentionConfig
+    governance: GovernanceConfig
+    security: SecurityConfig
 
     @classmethod
     def load(cls, path: Path) -> "Settings":
@@ -258,6 +369,15 @@ class Settings:
             archive=_build(ArchiveConfig, raw.get("archive")),
             runtime=_build(RuntimeConfig, raw.get("runtime")),
             ui=_build(UIConfig, raw.get("ui")),
+            retention=_build_defaulted(
+                RetentionConfig, raw.get("retention"),
+            ),
+            governance=_build_defaulted(
+                GovernanceConfig, raw.get("governance"),
+            ),
+            security=_build_defaulted(
+                SecurityConfig, raw.get("security"),
+            ),
         )
 
     def with_overrides(

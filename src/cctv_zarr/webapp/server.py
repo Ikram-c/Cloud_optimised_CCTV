@@ -31,18 +31,17 @@ from dataclasses import dataclass
 import json
 import logging
 import re
-import shutil
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from .. import ome, zarr_io
+from .. import audit, ome, retention, zarr_io
 from ..config import Settings
 from ..exceptions import QueryError, VideoOpenError
 from ..models import QuerySelection
@@ -101,6 +100,9 @@ class QueryRequest(BaseModel):
     start: Optional[str] = None
     end: Optional[str] = None
     movement_only: bool = False
+    client: Optional[str] = Field(
+        default=None, pattern=CLIENT_ID_PATTERN,
+    )
 
 
 class FramesRequest(BaseModel):
@@ -108,6 +110,9 @@ class FramesRequest(BaseModel):
 
     store: str
     chunk_index: int = Field(ge=0)
+    client: Optional[str] = Field(
+        default=None, pattern=CLIENT_ID_PATTERN,
+    )
 
 
 class ExportRequest(BaseModel):
@@ -118,6 +123,9 @@ class ExportRequest(BaseModel):
     end: Optional[str] = None
     movement_only: bool = False
     fps: float = Field(default=25.0, gt=0.0)
+    client: Optional[str] = Field(
+        default=None, pattern=CLIENT_ID_PATTERN,
+    )
 
 
 class PrefsRequest(BaseModel):
@@ -435,8 +443,11 @@ def _run_batch(settings: Settings, videos: List[Path], job: JobState):
         store = store_root / (video.stem + ".zarr")
         try:
             if store.is_dir():
-                shutil.rmtree(store)
+                _tombstone_store(store_root, store)
             result = writer.ingest(video, store)
+            retention.handle_source(
+                video, settings.retention, store_root,
+            )
             entry.update({
                 "store": store.name,
                 "seconds": round(
@@ -454,6 +465,66 @@ def _run_batch(settings: Settings, videos: List[Path], job: JobState):
             entry["error"] = str(e)
         job.item_done(entry)
     job.finish()
+
+
+def _check_auth(settings: Settings, authorization: Optional[str]):
+    """Enforce the panel access token when one is configured.
+
+    Args:
+        settings (Settings): Root configuration.
+        authorization (Optional[str]): The Authorization header.
+
+    Raises:
+        HTTPException: 401 when the token is missing or wrong.
+    """
+    token = settings.security.auth_token
+    if not token:
+        return
+    if authorization != f"Bearer {token}":
+        raise HTTPException(
+            status_code=401,
+            detail="An access code is required.",
+        )
+
+
+def _within(path: Path, root: Path) -> bool:
+    """Whether a resolved path sits inside a resolved root.
+
+    Args:
+        path (Path): Candidate path (resolved).
+        root (Path): Confinement root (resolved).
+
+    Returns:
+        bool: True for the root itself or any descendant.
+    """
+    return path == root or root in path.parents
+
+
+def _confine_or_400(path: Path, root: Path, what: str) -> Path:
+    """Resolve a path and require it inside a root directory.
+
+    Args:
+        path (Path): Candidate path.
+        root (Path): Confinement root.
+        what (str): Human label for the error message.
+
+    Returns:
+        Path: The resolved path.
+
+    Raises:
+        HTTPException: When outside the root or unresolvable.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        root = Path(root).resolve()
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not _within(resolved, root):
+        raise HTTPException(
+            status_code=400,
+            detail=f"That {what} is outside the video area.",
+        )
+    return resolved
 
 
 def _settings_or_400(config_path: Path) -> Settings:
@@ -757,9 +828,12 @@ def _collect_batch_videos(
     Raises:
         HTTPException: On missing folders/videos or empty requests.
     """
+    video_root = Path(settings.runtime.video_directory)
     videos: List[Path] = []
     if req.folder:
-        folder = Path(req.folder).expanduser()
+        folder = _confine_or_400(
+            Path(req.folder), video_root, "folder",
+        )
         if not folder.is_dir():
             raise HTTPException(
                 status_code=400,
@@ -769,7 +843,7 @@ def _collect_batch_videos(
             folder, settings.runtime.video_extensions,
         ))
     for raw in req.videos[:MAX_BATCH_VIDEOS]:
-        path = Path(raw).expanduser()
+        path = _confine_or_400(Path(raw), video_root, "video")
         if not path.is_file():
             raise HTTPException(
                 status_code=400,
@@ -844,14 +918,22 @@ def _add_basic_routes(app: FastAPI, ctx: PanelContext):
         return HTMLResponse(_INDEX_HTML)
 
     @app.get("/api/status")
-    def status(job: Optional[str] = None) -> dict:
+    def status(
+        job: Optional[str] = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Report one batch job's state, newest by default."""
+        settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         return ctx.queue.snapshot(job)
 
     @app.get("/api/config")
-    def config_info() -> dict:
+    def config_info(
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Expose the panel-relevant limits."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         return {
             "max_upload_mb": settings.ui.max_upload_mb,
             "max_queued_jobs": settings.ui.max_queued_jobs,
@@ -867,14 +949,18 @@ def _add_stores_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.get("/api/stores")
-    def stores() -> dict:
+    def stores(
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """List readable stores under store_directory."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         root = Path(settings.runtime.store_directory)
         found: List[dict] = []
         if root.is_dir():
             candidates = sorted(
-                p for p in root.iterdir() if p.is_dir()
+                p for p in root.iterdir()
+                if p.is_dir() and not p.name.startswith("_")
             )
             for path in candidates[:MAX_STORES_LISTED]:
                 summary = _store_summary(path)
@@ -892,17 +978,18 @@ def _add_browse_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/browse")
-    def browse(req: BrowseRequest) -> dict:
+    def browse(
+        req: BrowseRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """List one folder's subfolders and selectable videos."""
         settings = _settings_or_400(ctx.config_path)
-        base = (
-            Path(req.path).expanduser()
-            if req.path else Path(settings.runtime.video_directory)
+        _check_auth(settings, authorization)
+        video_root = Path(settings.runtime.video_directory)
+        base = _confine_or_400(
+            Path(req.path) if req.path else video_root,
+            video_root, "folder",
         )
-        try:
-            base = base.resolve()
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e))
         if not base.is_dir():
             raise HTTPException(
                 status_code=400,
@@ -951,7 +1038,10 @@ def _add_upload_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/upload")
-    def upload(req: UploadRequest) -> dict:
+    def upload(
+        req: UploadRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Receive one part of a clicked-or-dropped video upload.
 
         Parts arrive in order per upload_id and append to a hidden
@@ -959,6 +1049,7 @@ def _add_upload_route(app: FastAPI, ctx: PanelContext):
         it to its final name and returns the saved path.
         """
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         name = _validate_upload_name(settings, req.name)
         payload = _decode_part(req.data)
         folder = Path(settings.runtime.video_directory)
@@ -979,9 +1070,13 @@ def _add_ingest_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/ingest")
-    def ingest(req: IngestRequest) -> dict:
+    def ingest(
+        req: IngestRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Queue a batch ingest for the worker thread."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         unique = _collect_batch_videos(settings, req)
         job_id = ctx.queue.submit(
             settings, unique, settings.ui.max_queued_jobs,
@@ -1004,9 +1099,13 @@ def _add_query_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/query")
-    def query(req: QueryRequest) -> dict:
+    def query(
+        req: QueryRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Resolve a time/movement query to chunk records."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         client = _open_query(settings, req.store)
         movement = True if req.movement_only else None
         try:
@@ -1015,6 +1114,11 @@ def _add_query_route(app: FastAPI, ctx: PanelContext):
             )
         except QueryError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        audit.log_access(
+            Path(settings.runtime.store_directory), "query",
+            req.store, matched=len(selection.records),
+            client=req.client or "",
+        )
         all_records = client.records
         return {
             "records": [
@@ -1043,9 +1147,18 @@ def _add_frames_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/frames")
-    def frames(req: FramesRequest) -> dict:
+    def frames(
+        req: FramesRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Return JPEG previews for one chunk's section."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
+        audit.log_access(
+            Path(settings.runtime.store_directory), "frames",
+            req.store, chunk=req.chunk_index,
+            client=req.client or "",
+        )
         client = _open_query(settings, req.store)
         matched = [
             r for r in client.records
@@ -1078,9 +1191,13 @@ def _add_export_route(app: FastAPI, ctx: PanelContext):
     """
 
     @app.post("/api/export")
-    def export(req: ExportRequest) -> dict:
-        """Export the matching section as an MP4 clip."""
+    def export(
+        req: ExportRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Export the matching section as an MP4 clip (logged)."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         client = _open_query(settings, req.store)
         movement = True if req.movement_only else None
         try:
@@ -1108,6 +1225,16 @@ def _add_export_route(app: FastAPI, ctx: PanelContext):
             )
         except QueryError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        store_root = Path(settings.runtime.store_directory)
+        audit.log_access(
+            store_root, "export", req.store,
+            destination=str(out_path), frames=written,
+            client=req.client or "",
+        )
+        retention.sweep_directory(
+            out_dir, settings.retention.exports_max_age_hours,
+            store_root, EXPORT_DIRNAME,
+        )
         return {
             "path": str(out_path),
             "frames": written,
@@ -1124,12 +1251,16 @@ def _add_prefs_routes(app: FastAPI, ctx: PanelContext):
     """
 
     @app.get("/api/prefs")
-    def read_prefs(client: Optional[str] = None) -> dict:
+    def read_prefs(
+        client: Optional[str] = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Return one client's auto-saved panel state."""
         try:
             settings = Settings.load(ctx.config_path)
         except (FileNotFoundError, KeyError, ValueError):
             return {"prefs": {}}
+        _check_auth(settings, authorization)
         key = (
             client if client and CLIENT_ID_RE.match(client)
             else DEFAULT_PREFS_CLIENT
@@ -1143,9 +1274,13 @@ def _add_prefs_routes(app: FastAPI, ctx: PanelContext):
             return {"prefs": _read_prefs_file(path).get(key, {})}
 
     @app.post("/api/prefs")
-    def write_prefs(req: PrefsRequest) -> dict:
+    def write_prefs(
+        req: PrefsRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
         """Persist one client's auto-saved panel state."""
         settings = _settings_or_400(ctx.config_path)
+        _check_auth(settings, authorization)
         root = Path(settings.runtime.store_directory)
         root.mkdir(parents=True, exist_ok=True)
         key = req.client or DEFAULT_PREFS_CLIENT
@@ -1173,6 +1308,30 @@ _ROUTE_REGISTRARS = (
     _add_export_route,
     _add_prefs_routes,
 )
+
+
+def _tombstone_store(store_root: Path, store: Path):
+    """Move an existing store aside instead of destroying it.
+
+    Re-ingest never silently erases prior footage: the old store
+    moves under ``_replaced`` and the move lands in the deletion
+    journal, so an operator can evidence what the archive held.
+
+    Args:
+        store_root (Path): The stores directory.
+        store (Path): The store being replaced.
+    """
+    graveyard = store_root / "_replaced"
+    graveyard.mkdir(parents=True, exist_ok=True)
+    dest = graveyard / store.name
+    for attempt in range(1, MAX_NAME_COLLISIONS + 1):
+        if not dest.exists():
+            break
+        dest = graveyard / f"{store.name}.{attempt}"
+    store.rename(dest)
+    audit.log_deletion(
+        store_root, "replace", store.name, moved_to=str(dest),
+    )
 
 
 def create_app(config_path: Path) -> FastAPI:
@@ -1207,6 +1366,15 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     args = parser.parse_args()
     settings = Settings.load(args.config)
+    loopback = settings.ui.host in ("127.0.0.1", "localhost", "::1")
+    if not loopback and not (
+        settings.security.auth_token and settings.security.allow_remote
+    ):
+        raise SystemExit(
+            "refusing to serve footage beyond loopback: set "
+            "security.auth_token and security.allow_remote, and put "
+            "TLS termination in front (GDPR Art. 32)"
+        )
     import uvicorn
     uvicorn.run(
         create_app(args.config),
@@ -1500,6 +1668,18 @@ label.field {
       <div class="sub">Your camera footage, organised</div></div>
     </div>
 
+    <div class="card" id="auth-card" hidden>
+      <h2>Enter your access code</h2>
+      <div class="sub">This archive is protected. Ask the person
+      who runs it for the code.</div>
+      <label class="field" for="auth-code">Access code</label>
+      <input type="text" id="auth-code" autocomplete="off">
+      <div class="row">
+        <button class="primary" id="btn-auth">Unlock</button>
+      </div>
+      <div class="error" id="auth-error"></div>
+    </div>
+
     <section class="view active" id="view-ingest">
       <div class="card">
         <h2>Choose videos</h2>
@@ -1731,19 +1911,55 @@ function delayedSpinner(el, promise) {
   });
 }
 
+function loadAuthToken() {
+  try {
+    return window.localStorage.getItem("cctvPanelAuth") || "";
+  } catch (e) { return ""; }
+}
+let authToken = loadAuthToken();
+
 async function api(path, body) {
-  const options = body === undefined ? {} : {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
-  };
+  const headers = {};
+  if (authToken) { headers.Authorization = "Bearer " + authToken; }
+  let options = {headers: headers};
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    options = {
+      method: "POST", headers: headers,
+      body: JSON.stringify(body),
+    };
+  }
   const res = await fetch(path, options);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.detail || ("HTTP " + res.status));
+    if (res.status === 401) {
+      document.getElementById("auth-card").hidden = false;
+    }
+    const err = new Error(data.detail || ("HTTP " + res.status));
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
+
+document.getElementById("btn-auth")
+  .addEventListener("click", async () => {
+    haptic(10);
+    authToken =
+      document.getElementById("auth-code").value.trim();
+    try {
+      window.localStorage.setItem("cctvPanelAuth", authToken);
+    } catch (e) {}
+    try {
+      await api("/api/config");
+      document.getElementById("auth-card").hidden = true;
+      document.getElementById("auth-error").textContent = "";
+      restore();
+    } catch (e) {
+      document.getElementById("auth-error").textContent =
+        "That code did not work. Please try again.";
+    }
+  });
 
 function switchTab(name) {
   document.querySelectorAll("[data-tab]").forEach(b =>
@@ -2234,6 +2450,7 @@ function queryBody() {
   const body = {
     store: document.getElementById("query-store").value.trim(),
     movement_only: document.getElementById("movement-only").checked,
+    client: clientId,
   };
   const start = document.getElementById("query-start").value.trim();
   const end = document.getElementById("query-end").value.trim();
@@ -2380,6 +2597,7 @@ async function openSheet(chunk) {
     const data = await delayedSpinner(spinner, api("/api/frames", {
       store: document.getElementById("query-store").value.trim(),
       chunk_index: chunk.index,
+      client: clientId,
     }));
     const preview = document.getElementById("sheet-preview");
     for (const f of data.frames) {

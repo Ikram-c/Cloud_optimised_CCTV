@@ -264,6 +264,39 @@ uv run pytest        # 43 tests, fully offline (synthetic scenes, mock GCS)
 scenes do not; `tests/test_query_archive.py` proves a movement query
 downloads only the flagged chunk objects and nothing else.
 
+## EU / GDPR posture
+
+Compliance capabilities ship built in and default-on - see
+`COMPLIANCE.md` for the full mapping to the review findings.
+Retention is enforced chunk-by-chunk from manifest timestamps
+(`retention:` config; `cctv-zarr prune`, journalled), with
+separate clocks for movement and quiet footage and an option to
+never store quiet chunks at all. Subject-access and erasure
+tooling exist (`cctv-zarr access-request` with redaction masks,
+`cctv-zarr erase` across store, archive, and cache). The panel
+requires an access code when configured, refuses to leave loopback
+without one, confines browsing/ingest to the video area, tombstones
+instead of destroying stores on re-ingest, and access-logs every
+query, preview, and export. Archive objects can be encrypted
+client-side, bucket location is verified (Chapter V), and every
+store carries governance metadata including a non-biometric-source
+declaration backed by an acceptable-use clause in the LICENSE.
+Deployment contexts matter: workplace and in-vehicle uses engage
+national procedural gates (works councils, inspectorates, sectoral
+rules) that are the operator's responsibility, and
+`flow.record_events: false` is the minimising setting for those
+contexts. None of this is legal advice.
+
+## Deploying on Google Compute Engine (free trial)
+
+`deploy/gce/` holds a complete deployment sized for a free-tier
+e2-micro with a 30 GB disk: `setup_gce.sh` (swap, headless-OpenCV
+venv via the `[gce]` extra, systemd service, daily retention prune
+timer), `config.gce.yaml` (512 MB upload cap, tight retention
+clocks, loopback + SSH-tunnel access), and a README with the full
+disk budget - venv, the largest video, its store, the demo archive
+copy, and exports all total under 8 GB of the 30 GB disk.
+
 ## Known limitations
 
 - The GOP grid is configured, not parsed from the bitstream; set

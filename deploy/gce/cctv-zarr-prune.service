@@ -1,0 +1,10 @@
+[Unit]
+Description=cctv_zarr retention prune (storage limitation)
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=/opt/cctv_zarr
+ExecStart=/opt/cctv_zarr/venv/bin/cctv-zarr \
+  --config /opt/cctv_zarr/config.yaml prune --archive \
+  --cache /opt/cctv_zarr/data/query_cache

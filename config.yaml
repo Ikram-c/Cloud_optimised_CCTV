@@ -44,3 +44,23 @@ ui:
   preview_max_frames: 60        # frames per preview request
   max_upload_mb: 0              # per-video upload cap, 0 = off
   max_queued_jobs: 4            # batches allowed to wait in line
+retention:
+  enabled: true                 # storage limitation (Art. 5(1)(e))
+  movement_max_age_hours: 720   # movement footage: 30 days
+  non_movement_max_age_hours: 72
+  exports_max_age_hours: 72     # exported clips expire too
+  cache_max_age_hours: 24       # query cache expires
+  keep_non_movement: true       # false = never store quiet chunks
+  source_after_ingest: keep     # keep | quarantine | delete
+governance:
+  controller: ""                # who the data controller is
+  site_id: ""
+  purpose: ""
+  legal_basis: ""
+  retention_policy: ""
+  dpo_contact: ""
+security:
+  auth_token: ""                # panel access code (required
+  allow_remote: false           #   before leaving loopback)
+  encrypt_archive: false        # client-side Fernet on objects
+  encryption_key: ""

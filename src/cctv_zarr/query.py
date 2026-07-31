@@ -58,6 +58,41 @@ def _as_time(value: TimeLike) -> Optional[datetime]:
     return value
 
 
+def _redact(
+    frame: np.ndarray, mask_regions: Optional[List[tuple]],
+) -> np.ndarray:
+    """Black out fractional rectangles of one frame.
+
+    Args:
+        frame (np.ndarray): The frame (grayscale or BGR).
+        mask_regions (Optional[List[tuple]]): Fractional
+            (x0, y0, x1, y1) rectangles in [0, 1].
+
+    Returns:
+        np.ndarray: The frame, redacted copies where masked.
+
+    Raises:
+        QueryError: On malformed regions.
+    """
+    if not mask_regions:
+        return frame
+    height, width = frame.shape[:2]
+    out = frame.copy()
+    for region in mask_regions:
+        if len(region) != 4:
+            raise QueryError(
+                "mask region must be (x0, y0, x1, y1)",
+            )
+        x0, y0, x1, y1 = (max(0.0, min(1.0, v)) for v in region)
+        if x1 <= x0 or y1 <= y0:
+            raise QueryError("mask region is empty")
+        out[
+            int(y0 * height):max(int(y1 * height), int(y0 * height) + 1),
+            int(x0 * width):max(int(x1 * width), int(x0 * width) + 1),
+        ] = 0
+    return out
+
+
 class QueryClient:
     """Plans and executes chunk-level queries against one store."""
 
@@ -211,12 +246,21 @@ class QueryClient:
             self.root / ome.MOVEMENT_PATH
         ).read_full()
 
-    def export_frames(self, selection: QuerySelection, out_dir: Path) -> int:
+    def export_frames(
+        self,
+        selection: QuerySelection,
+        out_dir: Path,
+        mask_regions: Optional[List[tuple]] = None,
+    ) -> int:
         """Write a selection's frames as PNGs named by timestamp.
 
         Args:
             selection (QuerySelection): From select().
             out_dir (Path): Destination directory.
+            mask_regions (Optional[List[tuple]]): Fractional
+                (x0, y0, x1, y1) rectangles blacked out of every
+                frame - redaction of third parties for subject
+                access copies (GDPR Art. 15).
 
         Returns:
             int: Number of frames written.
@@ -227,11 +271,18 @@ class QueryClient:
         for frame, ts in zip(frames, times):
             stamp = datetime.fromtimestamp(ts, tz=timezone.utc)
             name = stamp.strftime("%Y%m%dT%H%M%S_%f") + ".png"
-            cv2.imwrite(str(out_dir / name), frame)
+            cv2.imwrite(
+                str(out_dir / name),
+                _redact(frame, mask_regions),
+            )
         return len(frames)
 
     def export_mp4(
-        self, selection: QuerySelection, out_path: Path, fps: float = 25.0,
+        self,
+        selection: QuerySelection,
+        out_path: Path,
+        fps: float = 25.0,
+        mask_regions: Optional[List[tuple]] = None,
     ) -> int:
         """Write a selection's frames as one H.264-family MP4 clip.
 
@@ -239,6 +290,10 @@ class QueryClient:
             selection (QuerySelection): From select().
             out_path (Path): Destination .mp4 path.
             fps (float): Playback rate.
+            mask_regions (Optional[List[tuple]]): Fractional
+                (x0, y0, x1, y1) rectangles blacked out of every
+                frame - redaction of third parties for subject
+                access copies (GDPR Art. 15).
 
         Returns:
             int: Number of frames written.
@@ -258,7 +313,7 @@ class QueryClient:
         if not writer.isOpened():
             raise QueryError(f"cannot open video writer for {out_path}")
         for frame in frames:
-            writer.write(frame)
+            writer.write(_redact(frame, mask_regions))
         writer.release()
         return len(frames)
 

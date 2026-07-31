@@ -1,0 +1,17 @@
+[Unit]
+Description=cctv_zarr web panel
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=/opt/cctv_zarr
+ExecStart=/opt/cctv_zarr/venv/bin/cctv-zarr-ui \
+  --config /opt/cctv_zarr/config.yaml
+Restart=on-failure
+RestartSec=5
+MemoryMax=700M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

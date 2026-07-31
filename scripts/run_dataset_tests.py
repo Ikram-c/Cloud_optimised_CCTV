@@ -318,6 +318,10 @@ def main() -> int:
     parser.add_argument("--out", type=Path,
                         default=Path("dataset_report.csv"),
                         help="CSV report path (default dataset_report.csv)")
+    parser.add_argument("--allow-real-archive", action="store_true",
+                        help="permit --full against a non-mock "
+                             "archive (real footage of people needs "
+                             "its own lawful basis - Art. 5(1)(b))")
     args = parser.parse_args()
 
     root = args.root.expanduser()
@@ -329,6 +333,18 @@ def main() -> int:
         Path(__file__).resolve().parent.parent / "config.yaml"
     )
     settings = Settings.load(config_path)
+    if (
+        args.full
+        and not settings.archive.use_mock_gcs
+        and not args.allow_real_archive
+    ):
+        print(
+            "error: refusing to upload dataset footage to a real "
+            "archive; development runs should stay on the mock "
+            "(pass --allow-real-archive to override)",
+            file=sys.stderr,
+        )
+        return 2
 
     videos: List[Tuple[Path, str]] = []
     split_path = None if args.no_split else (

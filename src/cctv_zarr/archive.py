@@ -38,6 +38,35 @@ try:
 except ImportError:
     GCS_AVAILABLE = False
 
+try:
+    from cryptography.fernet import Fernet
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+
+def build_cipher(key: str):
+    """Build the client-side archive cipher from a Fernet key.
+
+    Args:
+        key (str): A urlsafe-base64 32-byte Fernet key.
+
+    Returns:
+        The cipher object.
+
+    Raises:
+        ArchiveError: When cryptography is unavailable or the key
+            is invalid.
+    """
+    if not CRYPTO_AVAILABLE:
+        raise ArchiveError(
+            "encrypt_archive requires the 'cryptography' package",
+        )
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, TypeError) as e:
+        raise ArchiveError(f"invalid encryption_key: {e}")
+
 
 class MockBlob:
     """A blob backed by a file under the mock bucket root."""
@@ -60,6 +89,11 @@ class MockBlob:
 
     def exists(self) -> bool:
         return self._path.exists()
+
+    def delete(self):
+        if not self._path.exists():
+            raise FileNotFoundError(f"mock blob missing: {self.name}")
+        self._path.unlink()
 
 
 class MockBucket:
@@ -139,6 +173,7 @@ class CloudArchive:
         prefix: str,
         retry_attempts: int = RETRY_ATTEMPTS,
         retry_base_delay_s: float = RETRY_BASE_DELAY_S,
+        cipher=None,
     ):
         """Bind to a bucket and prefix.
 
@@ -149,6 +184,9 @@ class CloudArchive:
             retry_attempts (int): Bounded tries per object transfer.
             retry_base_delay_s (float): First backoff delay; doubles
                 per retry up to RETRY_MAX_DELAY_S.
+            cipher: Optional client-side cipher (build_cipher);
+                every object is encrypted before upload and
+                decrypted after download.
 
         Raises:
             ArchiveError: On a non-positive retry budget.
@@ -162,6 +200,61 @@ class CloudArchive:
         self.prefix = prefix.strip("/")
         self.retry_attempts = retry_attempts
         self.retry_base_delay_s = retry_base_delay_s
+        self.cipher = cipher
+
+    def verify_location(self, expected: Optional[str]) -> bool:
+        """Check the bucket's physical location (GDPR Chapter V).
+
+        Args:
+            expected (Optional[str]): Required location; None
+                skips the check.
+
+        Returns:
+            bool: True when acceptable (mock buckets are local).
+
+        Raises:
+            ArchiveError: When a real bucket's location disagrees.
+        """
+        if expected is None:
+            return True
+        actual = getattr(self.bucket, "location", None)
+        if actual is None:
+            return True
+        if str(actual).lower() != expected.lower():
+            raise ArchiveError(
+                f"bucket location {actual} != required {expected}",
+            )
+        return True
+
+    def _put_file(self, key: str, path: Path):
+        """Upload one file, encrypting when a cipher is bound.
+
+        Args:
+            key (str): Object key.
+            path (Path): Source file.
+        """
+        if self.cipher is None:
+            self.bucket.blob(key).upload_from_filename(str(path))
+            return
+        payload = self.cipher.encrypt(path.read_bytes())
+        tmp = path.parent / (path.name + ".enc.tmp")
+        tmp.write_bytes(payload)
+        try:
+            self.bucket.blob(key).upload_from_filename(str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _get_file(self, key: str, dest: Path):
+        """Download one file, decrypting when a cipher is bound.
+
+        Args:
+            key (str): Object key.
+            dest (Path): Destination file.
+        """
+        self.bucket.blob(key).download_to_filename(str(dest))
+        if self.cipher is None:
+            return
+        dest.write_bytes(self.cipher.decrypt(dest.read_bytes()))
 
     def _with_retries(self, label: str, operation: Callable):
         """Run one network operation with bounded backoff.
@@ -237,8 +330,7 @@ class CloudArchive:
             key = self._key(store_name, rel)
             self._with_retries(
                 f"upload {rel}",
-                lambda p=path, k=key:
-                    self.bucket.blob(k).upload_from_filename(str(p)),
+                lambda p=path, k=key: self._put_file(k, p),
             )
             uploaded.add(rel)
             self._write_state(state_path, uploaded)
@@ -339,13 +431,41 @@ class CloudArchive:
             try:
                 self._with_retries(
                     f"download {rel}",
-                    lambda k=key, r=rel: self.bucket.blob(
-                        k
-                    ).download_to_filename(str(dest / r)),
+                    lambda k=key, r=rel:
+                        self._get_file(k, dest / r),
                 )
             except FileNotFoundError as e:
                 raise ArchiveError(str(e))
         return dest
+
+    def delete_objects(
+        self, store_name: str, rel_paths: List[str],
+    ) -> int:
+        """Delete selected objects of one store from the archive.
+
+        Args:
+            store_name (str): Store name under the prefix.
+            rel_paths (List[str]): Store-relative paths to delete.
+
+        Returns:
+            int: Objects actually deleted (missing ones skipped).
+        """
+        count = 0
+        for rel in rel_paths:
+            key = self._key(store_name, rel)
+            try:
+                self._with_retries(
+                    f"delete {rel}",
+                    lambda k=key: self.bucket.blob(k).delete(),
+                )
+                count += 1
+            except FileNotFoundError:
+                logger.info("Already absent in archive: %s", key)
+        logger.info(
+            "Deleted %d object(s) of %s from the archive",
+            count, store_name,
+        )
+        return count
 
     def list_store(self, store_name: str) -> List[str]:
         """List a store's object keys, store-relative.

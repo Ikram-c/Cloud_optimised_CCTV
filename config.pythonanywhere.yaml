@@ -44,3 +44,23 @@ ui:
   preview_max_frames: 40
   max_upload_mb: 50
   max_queued_jobs: 4
+retention:
+  enabled: true
+  movement_max_age_hours: 720
+  non_movement_max_age_hours: 72
+  exports_max_age_hours: 72
+  cache_max_age_hours: 24
+  keep_non_movement: true
+  source_after_ingest: keep
+governance:
+  controller: ""
+  site_id: ""
+  purpose: "demonstration"
+  legal_basis: ""
+  retention_policy: ""
+  dpo_contact: ""
+security:
+  auth_token: ""
+  allow_remote: false
+  encrypt_archive: false
+  encryption_key: ""
