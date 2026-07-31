@@ -147,6 +147,32 @@ class ZarrArray:
             raw = zlib.compress(raw, self._level)
         (self.path / _chunk_key(indices)).write_bytes(raw)
 
+    def chunk_path(self, indices: Sequence[int]) -> Path:
+        """The on-disk path of one chunk.
+
+        Args:
+            indices (Sequence[int]): Chunk grid indices.
+
+        Returns:
+            Path: The chunk file path (may not exist).
+        """
+        return self.path / _chunk_key(indices)
+
+    def delete_chunk(self, indices: Sequence[int]) -> bool:
+        """Delete one chunk file; reads then return fill values.
+
+        Args:
+            indices (Sequence[int]): Chunk grid indices.
+
+        Returns:
+            bool: True when a chunk file existed and was removed.
+        """
+        path = self.chunk_path(indices)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def read_chunk(self, indices: Sequence[int]) -> np.ndarray:
         """Read one chunk (full chunk shape, fill where unwritten).
 

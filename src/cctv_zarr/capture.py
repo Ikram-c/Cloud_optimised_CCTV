@@ -80,12 +80,17 @@ def iter_frames(
         Tuple[int, np.ndarray]: Frame index and BGR frame.
     """
     yielded, fails, pos = 0, 0, 0
-    while yielded < max_frames:
+    limit = (max_frames + 1) * (max_fails + 1)
+    for _ in range(limit):
+        if yielded >= max_frames:
+            return
         ret, frame = capture.read()
         if not ret or frame is None:
             fails += 1
             if fails > max_fails:
-                logger.warning("Failure budget exhausted at frame %d", pos)
+                logger.warning(
+                    "Failure budget exhausted at frame %d", pos,
+                )
                 return
             pos += 1
             continue

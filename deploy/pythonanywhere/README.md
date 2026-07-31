@@ -67,6 +67,17 @@ is beta: no static-file mappings and limited web UI management.
   `~/.virtualenvs/cctvzarr/bin/cctv-zarr --config config.pythonanywhere.yaml ingest videos/cam01.mp4 --upload`
 - Free accounts have a 512 MB disk quota - video processing fills it
   quickly. Keep test clips short or upgrade for real footage.
+- `config.pythonanywhere.yaml` caps panel uploads at 50 MB per video
+  (`ui.max_upload_mb`) so one visitor cannot fill the disk; the cap
+  is shown in the drop zone and enforced on both ends. Raise it (or
+  set 0 to disable) on a paid account.
+- Concurrent demo visitors are expected: batches queue in a bounded
+  waiting line (`ui.max_queued_jobs`, default 4) served by one
+  worker, each browser tracks its own job, and panel state is saved
+  per browser - so several people can click through the demo at
+  once without stepping on each other. On free accounts the shared
+  CPU allowance still applies; pre-ingest the showpiece stores and
+  let visitors mostly browse, search, and view Results.
 - Uploads from the panel arrive in 8 MB parts, well under the
   platform's request-size limit.
 - The panel has no authentication. On PythonAnywhere it is public at

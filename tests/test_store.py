@@ -47,6 +47,17 @@ class TestStoreLayout:
         assert result.movement_chunks >= 1
         assert result.motion_events >= 1
 
+    def test_compression_metrics_recorded(self, store):
+        dest, result = store
+        assert result.stored_mb > 0
+        assert result.compression_ratio > 1.0
+        assert result.footprint_ratio >= result.compression_ratio
+        block = zarr_io.read_attrs(dest)["cctv"]["compression"]
+        assert block["ratio"] > 1.0
+        assert block["stored_mb"] > 0
+        assert block["raw_mb"] > block["stored_mb"]
+        assert block["source_mb"] > 0
+
     def test_image_array_is_tczyx_gop_chunked(self, store):
         dest, _ = store
         meta = json.loads((dest / "0" / ".zarray").read_text())

@@ -17,18 +17,20 @@ flow:
   match_distance_frac: 0.2
   min_track_frames: 3
   max_tracks: 32
+  record_events: true
 zarr:
   resize_width: 320
   grayscale: false
   compression_level: 6
 archive:
   gcs_bucket: cctv-archive
-  gcs_prefix: sites/default
-  use_mock_gcs: true
-  local_root: mock_gcs
+  gcs_prefix: sites/gce-demo
+  use_mock_gcs: true            # keeps all footage on this VM
+  local_root: /opt/cctv_zarr/data/mock_gcs
+  bucket_location: null         # set an EU region for a real bucket
 runtime:
-  video_directory: videos
-  store_directory: stores
+  video_directory: /opt/cctv_zarr/data/videos
+  store_directory: /opt/cctv_zarr/data/stores
   default_fps: 25.0
   max_consecutive_fails: 25
   video_extensions:
@@ -38,29 +40,29 @@ runtime:
   - .mov
   timezone: UTC
 ui:
-  host: 127.0.0.1
+  host: 127.0.0.1               # loopback; reach it by SSH tunnel
   port: 8432
   preview_width: 480
   preview_max_frames: 40
-  max_upload_mb: 50
-  max_queued_jobs: 4
+  max_upload_mb: 512            # largest single video (disk budget)
+  max_queued_jobs: 2
 retention:
   enabled: true
-  movement_max_age_hours: 720
-  non_movement_max_age_hours: 72
-  exports_max_age_hours: 72
+  movement_max_age_hours: 168   # 7 days on the small trial disk
+  non_movement_max_age_hours: 48
+  exports_max_age_hours: 24
   cache_max_age_hours: 24
   keep_non_movement: true
-  source_after_ingest: keep
+  source_after_ingest: quarantine
 governance:
   controller: ""
-  site_id: ""
+  site_id: "gce-trial-demo"
   purpose: "demonstration"
   legal_basis: ""
-  retention_policy: ""
+  retention_policy: "7d movement / 48h quiet / 24h exports"
   dpo_contact: ""
 security:
-  auth_token: ""
+  auth_token: ""                # set one before allow_remote: true
   allow_remote: false
   encrypt_archive: false
   encryption_key: ""

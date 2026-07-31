@@ -120,6 +120,31 @@ cctv-zarr --config config.yaml query cam01.zarr \
 cctv-zarr query stores/cam01.zarr --local --movement-only
 ```
 
+## Compression, highlighted
+
+Every ingest measures and records its own compression in the store
+manifest (`cctv.compression`): the stored size, the raw uncompressed
+size at source resolution, the source file size, the lossless codec
+ratio (zlib at the configured level, vs raw frames at the stored
+resolution), and the overall **footprint ratio** (resize + lossless
+compression together). The panel keeps the number in view: the
+Library header aggregates the whole archive ("Altogether: N MB of raw
+frames stored in M MB - Xx smaller than raw"), every Library row and
+every batch result carries its own "Xx smaller than raw", and a
+dedicated **Results** tab shows uncompressed vs stored storage: a
+hero figure with the aggregate ratio ("25.4x smaller - 618 MB stored
+instead of 15.3 GB uncompressed") over paired horizontal bars per
+recording, uncompressed against stored on a shared scale. The
+figures are honest by construction - the baseline is raw frames, and
+the source file size is stored alongside so the store is never
+misrepresented as smaller than the already-H.264-encoded original.
+
+For demos, `config.demo.yaml` (also mirrored into
+`config.pythonanywhere.yaml`) trades fidelity for speed and footprint:
+frames stored at 320 px wide with zlib level 6, motion analysis at
+128x96, a 3000-frame per-video cap, and lighter previews - on
+1080p source footage the footprint ratio lands around 25-40x.
+
 ## Network-loss redundancy
 
 Every archive transfer retries with bounded exponential backoff, and
@@ -137,20 +162,35 @@ uv sync --extra ui
 cctv-zarr-ui --config config.yaml     # open http://127.0.0.1:8432
 ```
 
-Three destinations (Add footage, Library, Search) in a fixed 49px tab
-bar that becomes a 260-320px sidebar on wide screens. Videos are
+Four destinations (Add footage, Library, Search, Results) in a fixed
+49px tab bar that becomes a 260-320px sidebar on wide screens. Videos are
 picked entirely by clicking: a "Choose files" button opens the native
 file dialog (with a "Choose a folder" variant and drag-and-drop onto
 the panel), picked files copy to the archive machine in bounded
 chunked uploads with a progress bar, and processing starts
-automatically when the copy finishes. The same view also browses
+automatically when the copy finishes. A per-video size cap
+(`ui.max_upload_mb`, off by default, 50 MB in the demo configs) is
+shown in the drop zone, enforced in the browser before any copying
+starts, and enforced again server-side.
+
+The panel is multi-user by design, sized for shared demos: each
+batch goes into a bounded waiting line (`ui.max_queued_jobs`)
+served by one worker, so two people pressing "Add" at the same
+moment both succeed - the second sees "Waiting in line - 1 task(s)
+ahead" instead of an error, and nothing fights for the CPU. Every
+browser polls its own job by id and auto-saves its own panel state
+(a per-browser client id), so concurrent visitors never see each
+other's progress bars or overwrite each other's saved searches. The same view also browses
 the server filesystem from the configured video directory: folders open
 in place, video rows are selectable (44px targets, size shown, an
 "Ingested" badge on files that already have a store), and a batch runs
 either the explicit selection or the whole folder - sequentially, with
 a live progress bar, the current filename, and per-video results in
 which one corrupt file fails alone without stopping the rest.
-The Query view renders an
+The Query view starts from a tap-to-choose
+recording list - every ingested video, including panel uploads,
+appears as a selectable 44px row with its movement summary, so
+nothing is ever typed - and renders an
 activity ring for the movement ratio, a single-series GOP-chunk timeline
 (movement chunks in the series hue, quiet chunks neutral, 2px gaps), and
 a 44px-row chunk list with per-chunk timestamps; tapping a chunk opens an
@@ -168,7 +208,9 @@ Every tunable lives in `config.yaml`: `gop` (encoder GOP length, frame
 cap), `flow` (Farnebäck parameters, motion threshold, minimum object
 size, the 5 s pause buffer, association radius, noise debounce),
 `zarr` (resize, grayscale, compression), `archive` (bucket,
-prefix, mock switch), `runtime` (paths, fps fallback, failure budget).
+prefix, mock switch), `runtime` (paths, fps fallback, failure
+budget), `ui` (host/port, previews, the per-video upload cap, and
+the batch waiting-line depth for concurrent users).
 
 ## Deploying via GitHub
 
@@ -176,8 +218,10 @@ Three GitHub Actions workflows ship with the repo (`.github/workflows/`):
 
 - **ci.yml** - on every push and pull request: the repo style gate
   (`scripts/check_style.py`: 79-column limit, no tabs, no comments
-  outside docstrings) plus the full offline test suite on Python 3.11
-  and 3.12.
+  outside docstrings, and static NASA Power of 10 checks on the
+  library - no recursion, no while loops so every loop carries an
+  explicit fixed bound, no function over 60 lines) plus the full
+  offline test suite on Python 3.11 and 3.12.
 - **release.yml** - on pushing a tag like `v0.1.0`: re-runs the tests,
   builds the wheel and sdist, attaches them to a GitHub Release, and
   builds/pushes a Docker image to GitHub Container Registry as
@@ -219,6 +263,39 @@ uv run pytest        # 43 tests, fully offline (synthetic scenes, mock GCS)
 `tests/test_flow.py` proves a growing object triggers and lateral/static
 scenes do not; `tests/test_query_archive.py` proves a movement query
 downloads only the flagged chunk objects and nothing else.
+
+## EU / GDPR posture
+
+Compliance capabilities ship built in and default-on - see
+`COMPLIANCE.md` for the full mapping to the review findings.
+Retention is enforced chunk-by-chunk from manifest timestamps
+(`retention:` config; `cctv-zarr prune`, journalled), with
+separate clocks for movement and quiet footage and an option to
+never store quiet chunks at all. Subject-access and erasure
+tooling exist (`cctv-zarr access-request` with redaction masks,
+`cctv-zarr erase` across store, archive, and cache). The panel
+requires an access code when configured, refuses to leave loopback
+without one, confines browsing/ingest to the video area, tombstones
+instead of destroying stores on re-ingest, and access-logs every
+query, preview, and export. Archive objects can be encrypted
+client-side, bucket location is verified (Chapter V), and every
+store carries governance metadata including a non-biometric-source
+declaration backed by an acceptable-use clause in the LICENSE.
+Deployment contexts matter: workplace and in-vehicle uses engage
+national procedural gates (works councils, inspectorates, sectoral
+rules) that are the operator's responsibility, and
+`flow.record_events: false` is the minimising setting for those
+contexts. None of this is legal advice.
+
+## Deploying on Google Compute Engine (free trial)
+
+`deploy/gce/` holds a complete deployment sized for a free-tier
+e2-micro with a 30 GB disk: `setup_gce.sh` (swap, headless-OpenCV
+venv via the `[gce]` extra, systemd service, daily retention prune
+timer), `config.gce.yaml` (512 MB upload cap, tight retention
+clocks, loopback + SSH-tunnel access), and a README with the full
+disk budget - venv, the largest video, its store, the demo archive
+copy, and exports all total under 8 GB of the 30 GB disk.
 
 ## Known limitations
 

@@ -17,8 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gcs = ["google-cloud-storage>=2.14"]
+crypto = ["cryptography>=42"]
 ui = ["fastapi>=0.110", "uvicorn>=0.29"]
 pythonanywhere = ["a2wsgi>=1.10", "cctv_zarr[ui]"]
+gce = ["opencv-python-headless>=4.9", "cryptography>=42", "cctv_zarr[ui]"]
 dev = ["pytest>=8.0", "httpx>=0.27", "cctv_zarr[ui]"]
 
 [project.scripts]

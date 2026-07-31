@@ -31,22 +31,32 @@ const CANNED = {
     items: [
     {video: "gate_cam_morning.mp4", store: "gate_cam_morning.zarr",
      seconds: 148.0, frames: 3700, chunks: 124,
-     movement_chunks: 11, events: 3},
+     movement_chunks: 11, events: 3,
+     stored_mb: 301.5, footprint_ratio: 25.4},
     {video: "car_park_east.mp4", store: "car_park_east.zarr",
      seconds: 60.0, frames: 1500, chunks: 50,
-     movement_chunks: 0, events: 0},
+     movement_chunks: 0, events: 0,
+     stored_mb: 122.9, footprint_ratio: 25.3},
     {video: "loading_bay.mp4", store: "loading_bay.zarr",
      seconds: 95.2, frames: 2380, chunks: 80,
-     movement_chunks: 6, events: 2}],
+     movement_chunks: 6, events: 2,
+     stored_mb: 194.0, footprint_ratio: 25.5}],
     error: null},
   "/api/prefs": {prefs: {tab: "query", store: "gate_cam_morning.zarr"}},
+  "/api/config": {max_upload_mb: 50, max_queued_jobs: 4},
   "/api/stores": {stores: [
     {name: "gate_cam_morning.zarr", chunks: 124, movement_chunks: 11,
-     movement_ratio: 0.089, seconds: 148.0, size_mb: 301.5},
+     movement_ratio: 0.089, seconds: 148.0, size_mb: 301.5,
+     compression: {stored_mb: 301.5, raw_mb: 7672.3, source_mb: 402.1,
+       ratio: 2.8, footprint_ratio: 25.4}},
     {name: "car_park_east.zarr", chunks: 50, movement_chunks: 0,
-     movement_ratio: 0, seconds: 60.0, size_mb: 122.9},
+     movement_ratio: 0, seconds: 60.0, size_mb: 122.9,
+     compression: {stored_mb: 122.9, raw_mb: 3110.4, source_mb: 164.9,
+       ratio: 2.9, footprint_ratio: 25.3}},
     {name: "loading_bay.zarr", chunks: 80, movement_chunks: 6,
-     movement_ratio: 0.075, seconds: 95.2, size_mb: 194.0}]},
+     movement_ratio: 0.075, seconds: 95.2, size_mb: 194.0,
+     compression: {stored_mb: 194.0, raw_mb: 4935.2, source_mb: 259.4,
+       ratio: 2.8, footprint_ratio: 25.5}}]},
   "/api/browse": {path: "/data/videos", parent: "/data",
     folders: ["gate", "car_park"],
     videos: [
@@ -80,18 +90,19 @@ const EVENTS = [
   {start_time: iso(2, 24), end_time: iso(2, 54), seconds: 30.0},
 ];
 window.fetch = function (path, options) {
+  const key = String(path).split("?")[0];
   let body;
-  if (path === "/api/query") {
+  if (key === "/api/query") {
     const all = chunks();
     const recs = all.filter(c => c.movement_detected === 1);
     body = {records: recs, all_chunks: all, events: EVENTS,
             matched: recs.length, total: all.length};
-  } else if (path === "/api/ingest" || path === "/api/upload"
-             || path === "/api/export" || path === "/api/frames") {
+  } else if (key === "/api/ingest" || key === "/api/upload"
+             || key === "/api/export" || key === "/api/frames") {
     return Promise.resolve({ok: false, json: () =>
       Promise.resolve({detail: DEMO_NOTE})});
   } else {
-    body = CANNED[path] || {};
+    body = CANNED[key] || {};
   }
   return Promise.resolve({ok: true,
     json: () => Promise.resolve(body)});
